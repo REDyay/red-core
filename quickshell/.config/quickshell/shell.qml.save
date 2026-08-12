@@ -1,0 +1,63 @@
+import Quickshell
+import Quickshell.Io
+import QtQuick
+
+PanelWindow {
+    id: root
+
+    anchors {
+        top: true
+    }
+
+    implicitWidth: 360
+    implicitHeight: 48
+    color: "transparent"
+
+    property int activeWorkspace: 1
+
+    Process {
+        id: niriEvents
+        running: true
+        command: ["niri", "msg", "--json", "event-stream"]
+
+        stdout: SplitParser {
+            onRead: line => {
+                try {
+                    const event = JSON.parse(line)
+
+                    if (event.WorkspaceActivated && event.WorkspaceActivated.focused) {
+                        root.activeWorkspace = event.WorkspaceActivated.id
+                    }
+                } catch (e) {
+                }
+            }
+        }
+    }
+
+    Rectangle {
+        anchors.fill: parent
+        radius: 16
+        color: "#1e1e2e"
+
+        Row {
+            anchors.centerIn: parent
+            spacing: 18
+
+            Repeater {
+                model: 5
+
+                Rectangle {
+                    width: 32
+                    height: 32
+                    radius: 10
+
+                    color: root.activeWorkspace === index + 1
+                        ? "#89b4fa"
+                        : "#313244"
+
+                    Text {
+                        anchors.centerIn: parent
+                        text: index + 1
+
+                        color: root.activeWorkspace === index + 1
+                           

@@ -1,0 +1,70 @@
+* {
+    font: "monospace 12";
+
+    background: #1e1e2e;
+    background-alt: #313244;
+    foreground: #cdd6f4;
+
+    selected-background: #89b4fa;
+    selected-foreground: #11111b;
+}
+
+window {
+    width: 40%;
+    border: 2px;
+    border-radius: 12px;
+    border-color: @selected-background;
+    background-color: @background;
+}
+
+mainbox {
+    padding: 16px;
+    spacing: 12px;
+    background-color: @background;
+}
+
+inputbar {
+    padding: 10px;
+    border-radius: 8px;
+    background-color: @background-alt;
+    text-color: @foreground;
+}
+
+prompt {
+    background-color: transparent;
+    text-color: @foreground;
+}
+
+entry {
+    background-color: transparent;
+    text-color: @foreground;
+}
+
+listview {
+    lines: 8;
+    columns: 1;
+    spacing: 6px;
+    background-color: transparent;
+}
+
+element {
+    padding: 8px;
+    border-radius: 8px;
+    background-color: transparent;
+    text-color: @foreground;
+}
+
+element selected {
+    background-color: @selected-background;
+    text-color: @selected-foreground;
+}
+
+element-icon {
+    size: 24px;
+    background-color: transparent;
+}
+
+element-text {
+    background-color: transparent;
+    text-color: inherit;
+}

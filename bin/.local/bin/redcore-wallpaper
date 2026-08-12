@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+
+WALLPAPER="$1"
+STATE_DIR="$HOME/.local/state/red-core"
+STATE_FILE="$STATE_DIR/wallpaper"
+
+if [ -z "$WALLPAPER" ]; then
+    echo "Usage: redcore-wallpaper /path/to/image"
+    exit 1
+fi
+
+mkdir -p "$STATE_DIR"
+
+awww img "$WALLPAPER" --transition-type fade
+
+printf '%s\n' "$WALLPAPER" > "$STATE_FILE"

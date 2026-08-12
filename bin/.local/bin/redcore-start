@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+
+STATE_FILE="$HOME/.local/state/red-core/wallpaper"
+
+if ! pgrep -x awww-daemon >/dev/null; then
+    awww-daemon &
+    sleep 0.5
+fi
+
+if [ -f "$STATE_FILE" ]; then
+    WALLPAPER="$(cat "$STATE_FILE")"
+
+    if [ -f "$WALLPAPER" ]; then
+        awww img "$WALLPAPER" --transition-type fade
+    fi
+fi

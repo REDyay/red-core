@@ -16,6 +16,28 @@ PanelWindow {
     property var workspaces: []
     property int activeWorkspace: -1
 
+    property int cpuUsage: 0
+    property var cpuTemp: null
+    property int ramUsage: 0
+
+    property var gpuUsage: null
+    property string gpuVendor: "unknown"
+
+    property string networkType: "none"
+    property string networkInterface: ""
+    property int downloadSpeed: 0
+    property int uploadSpeed: 0
+
+    function formatSpeed(bytes) {
+        if (bytes >= 1024 * 1024)
+            return (bytes / 1024 / 1024).toFixed(1) + "M"
+
+        if (bytes >= 1024)
+            return (bytes / 1024).toFixed(1) + "K"
+
+        return bytes + "B"
+    }
+
     // =========================
     // NIRI WORKSPACES
     // =========================
@@ -60,6 +82,62 @@ PanelWindow {
 
     Process {
         id: workspaceSwitch
+    }
+
+    // =========================
+    // SYSTEM INFO
+    // =========================
+
+    Process {
+        id: systemInfoProcess
+
+        command: ["redcore-system-info"]
+
+        stdout: StdioCollector {
+            onStreamFinished: {
+                try {
+                    const data = JSON.parse(text)
+
+                    root.cpuUsage = data.cpu
+                    root.cpuTemp = data.cpuTemp
+                    root.ramUsage = data.ram
+
+                    root.gpuUsage = data.gpuUsage
+                    root.gpuVendor = data.gpuVendor
+
+                    root.networkInterface =
+                        data.network.interface
+
+                    root.networkType =
+                        data.network.type
+
+                    root.downloadSpeed =
+                        data.network.download
+
+                    root.uploadSpeed =
+                        data.network.upload
+
+                } catch (error) {
+                    console.log(
+                        "System info parse error:",
+                        error
+                    )
+                }
+            }
+        }
+    }
+
+    Timer {
+        interval: 2000
+        running: true
+        repeat: true
+        triggeredOnStart: true
+
+        onTriggered: {
+            if (!systemInfoProcess.running) {
+                systemInfoProcess.running = true
+            }
+        }
     }
 
     // =========================
@@ -124,13 +202,51 @@ PanelWindow {
                 spacing: 8
 
                 Text {
-                    text: "CPU --%"
+                    text:
+                        "CPU " +
+                        root.cpuUsage +
+                        "%" +
+                        (
+                            root.cpuTemp !== null
+                            ? " " + root.cpuTemp + "°"
+                            : ""
+                        )
+
                     color: "#cdd6f4"
                     font.pixelSize: 13
                 }
 
                 Text {
-                    text: "RAM --%"
+                    text:
+                        "RAM " +
+                        root.ramUsage +
+                        "%"
+
+                    color: "#cdd6f4"
+                    font.pixelSize: 13
+                }
+                Text {
+                   visible: root.gpuUsage !== null
+
+                   text:
+                       "GPU " +
+                        root.gpuUsage +
+                        "%"
+
+                   color: "#cdd6f4"
+                   font.pixelSize: 13
+                       }
+                Text {
+                    text:
+                        "↓" +
+                        root.formatSpeed(
+                            root.downloadSpeed
+                        ) +
+                        " ↑" +
+                        root.formatSpeed(
+                            root.uploadSpeed
+                        )
+
                     color: "#cdd6f4"
                     font.pixelSize: 13
                 }
@@ -233,7 +349,13 @@ PanelWindow {
             spacing: 14
 
             Text {
-                text: "WiFi"
+                text:
+                    root.networkType === "ethernet"
+                    ? "Ethernet"
+                    : root.networkType === "wifi"
+                    ? "WiFi"
+                    : "Offline"
+
                 color: "#cdd6f4"
                 font.pixelSize: 13
             }
@@ -244,24 +366,32 @@ PanelWindow {
                 font.pixelSize: 13
             }
 
-            // Battery will be dynamic later.
-            // It will only appear on devices that actually have one.
-
             Rectangle {
                 width: 1
                 height: 22
                 color: "#45475a"
-                anchors.verticalCenter: parent.verticalCenter
+                anchors.verticalCenter:
+                    parent.verticalCenter
             }
 
             Text {
-                text: Qt.formatDateTime(clock.date, "dd/MM")
+                text:
+                    Qt.formatDateTime(
+                        clock.date,
+                        "dd/MM"
+                    )
+
                 color: "#cdd6f4"
                 font.pixelSize: 13
             }
 
             Text {
-                text: Qt.formatDateTime(clock.date, "HH:mm")
+                text:
+                    Qt.formatDateTime(
+                        clock.date,
+                        "HH:mm"
+                    )
+
                 color: "#cdd6f4"
                 font.pixelSize: 13
             }
@@ -270,7 +400,8 @@ PanelWindow {
                 width: 1
                 height: 22
                 color: "#45475a"
-                anchors.verticalCenter: parent.verticalCenter
+                anchors.verticalCenter:
+                    parent.verticalCenter
             }
 
             // Power button

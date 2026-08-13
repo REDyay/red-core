@@ -1,7 +1,6 @@
 import Quickshell
 import Quickshell.Io
 import Quickshell.Services.Mpris
-import Quickshell.Services.Pipewire
 import QtQuick
 
 PanelWindow {
@@ -164,41 +163,6 @@ PanelWindow {
             if (!systemInfoProcess.running) {
                 systemInfoProcess.running = true
             }
-        }
-    }
-
-    // =========================
-    // PIPEWIRE AUDIO
-    // =========================
-
-    PwObjectTracker {
-        objects: [Pipewire.defaultAudioSink]
-    }
-
-    property var audioSink: Pipewire.defaultAudioSink
-
-    function changeVolume(delta) {
-        if (
-            root.audioSink === null ||
-            root.audioSink.audio === null
-        )
-            return
-
-        let value = root.audioSink.audio.volume + delta
-
-        if (value < 0)
-            value = 0
-
-        if (value > 1)
-            value = 1
-
-        root.audioSink.audio.volume = value
-
-        if (
-            root.audioSink.audio.muted &&
-            value > 0
-        ) {
-            root.audioSink.audio.muted = false
         }
     }
 
@@ -817,99 +781,6 @@ PanelWindow {
 
                             color: "#a6adc8"
                             font.pixelSize: 11
-                        }
-                    }
-                }
-
-                // System volume
-                Row {
-                    anchors.horizontalCenter: parent.horizontalCenter
-                    spacing: 12
-
-                    Rectangle {
-                        width: 38
-                        height: 30
-                        radius: 9
-                        color: "#313244"
-
-                        Text {
-                            anchors.centerIn: parent
-                            text: "−"
-                            color: "#cdd6f4"
-                            font.pixelSize: 17
-                        }
-
-                        MouseArea {
-                            anchors.fill: parent
-                            cursorShape: Qt.PointingHandCursor
-
-                            onClicked: {
-                                root.changeVolume(-0.05)
-                            }
-                        }
-                    }
-
-                    Rectangle {
-                        width: 84
-                        height: 30
-                        radius: 9
-                        color: "#313244"
-
-                        Text {
-                            anchors.centerIn: parent
-
-                            text:
-                                root.audioSink !== null &&
-                                root.audioSink.audio !== null
-                                ? (
-                                    root.audioSink.audio.muted
-                                    ? "Muted"
-                                    : Math.round(
-                                        root.audioSink.audio.volume * 100
-                                      ) + "%"
-                                  )
-                                : "--%"
-
-                            color: "#cdd6f4"
-                            font.pixelSize: 12
-                        }
-
-                        MouseArea {
-                            anchors.fill: parent
-                            cursorShape: Qt.PointingHandCursor
-
-                            onClicked: {
-                                if (
-                                    root.audioSink !== null &&
-                                    root.audioSink.audio !== null
-                                ) {
-                                    root.audioSink.audio.muted =
-                                        !root.audioSink.audio.muted
-                                }
-                            }
-                        }
-                    }
-
-                    Rectangle {
-                        width: 38
-                        height: 30
-                        radius: 9
-                        color: "#313244"
-
-                        Text {
-                            anchors.centerIn: parent
-                            text: "+"
-                            color: "#cdd6f4"
-                            font.pixelSize: 17
-                        }
-
-                        MouseArea {
-                            anchors.fill: parent
-                            cursorShape: Qt.PointingHandCursor
-
-                            onClicked: {
-                                root.changeVolume(0.05)
-                            }
                         }
                     }
                 }

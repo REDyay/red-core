@@ -18,14 +18,19 @@ PanelWindow {
     property var workspaces: []
     property int activeWorkspace: -1
 
-    // Last actually used media player.
-    // We keep its metadata even if the player disappears.
-    property var activePlayer: null
-    property string lastPlayerDbusName: ""
-    property string lastMediaTitle: ""
-    property string lastMediaArtist: ""
-    property string lastMediaArt: ""
-    property string lastMediaUri: ""
+    property var activePlayer: {
+        for (let i = 0; i < Mpris.players.values.length; i++) {
+            const player = Mpris.players.values[i]
+
+            if (player.playbackState === MprisPlaybackState.Playing)
+                return player
+        }
+
+        if (Mpris.players.values.length > 0)
+            return Mpris.players.values[0]
+
+        return null
+    }
 
     property int cpuUsage: 0
     property var cpuTemp: null
@@ -58,159 +63,6 @@ PanelWindow {
         const secs = total % 60
 
         return minutes + ":" + (secs < 10 ? "0" : "") + secs
-    }
-
-    // =========================
-    // MEDIA PLAYER TRACKING
-    // =========================
-
-    function rememberPlayer(player) {
-        if (player === null)
-            return
-
-        root.activePlayer = player
-        root.lastPlayerDbusName = player.dbusName || ""
-
-        if (player.trackTitle)
-            root.lastMediaTitle = player.trackTitle
-        else if (player.identity)
-            root.lastMediaTitle = player.identity
-
-        root.lastMediaArtist =
-            player.trackArtist ||
-            player.identity ||
-            ""
-
-        root.lastMediaArt =
-            player.trackArtUrl || ""
-
-        try {
-            const metadata = player.metadata
-
-            if (metadata) {
-                const uri = metadata["xesam:url"]
-
-                if (
-                    uri !== undefined &&
-                    uri !== null &&
-                    String(uri) !== ""
-                ) {
-                    root.lastMediaUri = String(uri)
-                }
-            }
-        } catch (error) {
-            console.log(
-                "Could not read media URI:",
-                error
-            )
-        }
-    }
-
-    function toggleOrResumeMedia() {
-        // Only control activePlayer if it is still alive in MPRIS.
-        if (root.activePlayer !== null) {
-            const players = Mpris.players.values
-            let playerAlive = false
-
-            for (let i = 0; i < players.length; i++) {
-                if (
-                    players[i].dbusName ===
-                    root.activePlayer.dbusName
-                ) {
-                    playerAlive = true
-                    break
-                }
-            }
-
-            if (
-                playerAlive &&
-                root.activePlayer.canTogglePlaying
-            ) {
-                root.activePlayer.togglePlaying()
-                return
-            }
-        }
-
-        // Reopen only remembered LOCAL files.
-        if (
-            root.lastMediaUri !== "" &&
-            root.lastMediaUri.startsWith("file://")
-        ) {
-            if (!resumeLocalMedia.running) {
-                resumeLocalMedia.command = [
-                    "mpv",
-                    "--no-terminal",
-                    "--",
-                    root.lastMediaUri
-                ]
-
-                resumeLocalMedia.running = true
-            }
-        }
-    }
-
-    Process {
-        id: resumeLocalMedia
-    }
-
-    Timer {
-        id: mediaPlayerTracker
-
-        interval: 350
-        running: true
-        repeat: true
-        triggeredOnStart: true
-
-        onTriggered: {
-            const players = Mpris.players.values
-
-            // First: keep the last-used player if it still exists.
-            let remembered = null
-
-            for (let i = 0; i < players.length; i++) {
-                const player = players[i]
-
-                if (
-                    player.dbusName ===
-                    root.lastPlayerDbusName
-                ) {
-                    remembered = player
-                    break
-                }
-            }
-
-            // If our remembered player is actively playing,
-            // keep it and refresh its metadata.
-            if (
-                remembered !== null &&
-                remembered.isPlaying
-            ) {
-                root.rememberPlayer(remembered)
-                return
-            }
-
-            // Otherwise look for a player that is actually playing.
-            for (let i = 0; i < players.length; i++) {
-                const player = players[i]
-
-                if (player.isPlaying) {
-                    root.rememberPlayer(player)
-                    return
-                }
-            }
-
-            // Nobody is playing.
-            // Keep our remembered player if it still exists.
-            if (remembered !== null) {
-                root.activePlayer = remembered
-                root.rememberPlayer(remembered)
-                return
-            }
-
-            // Last player disappeared (for example mpv after EOF).
-            // Keep its saved metadata, but don't jump to Brave/etc.
-            root.activePlayer = null
-        }
     }
 
     // =========================
@@ -515,10 +367,7 @@ PanelWindow {
                     cursorShape: Qt.PointingHandCursor
 
                     onClicked: {
-                        if (
-                            root.activePlayer !== null ||
-                            root.lastMediaTitle !== ""
-                        ) {
+                        if (root.activePlayer !== null) {
                             mediaPopup.visible = !mediaPopup.visible
                         }
                     }
@@ -607,45 +456,10 @@ PanelWindow {
                 font.pixelSize: 13
             }
 
-            Rectangle {
-                width: 64
-                height: 32
-                radius: 10
-                color: "#313244"
-
-                Text {
-                    anchors.centerIn: parent
-
-                    text:
-                        root.audioSink !== null &&
-                        root.audioSink.audio !== null
-                        ? (
-                            root.audioSink.audio.muted
-                            ? "Muted"
-                            : Math.round(
-                                root.audioSink.audio.volume * 100
-                              ) + "%"
-                          )
-                        : "--%"
-
-                    color: "#cdd6f4"
-                    font.pixelSize: 13
-                }
-
-                MouseArea {
-                    anchors.fill: parent
-                    cursorShape: Qt.PointingHandCursor
-
-                    onClicked: {
-                        if (
-                            root.audioSink !== null &&
-                            root.audioSink.audio !== null
-                        ) {
-                            root.audioSink.audio.muted =
-                                !root.audioSink.audio.muted
-                        }
-                    }
-                }
+            Text {
+                text: "Vol --%"
+                color: "#cdd6f4"
+                font.pixelSize: 13
             }
 
             Rectangle {
@@ -764,10 +578,9 @@ PanelWindow {
                             anchors.fill: parent
 
                             source:
-                                root.activePlayer !== null &&
-                                root.activePlayer.trackArtUrl !== ""
+                                root.activePlayer !== null
                                 ? root.activePlayer.trackArtUrl
-                                : root.lastMediaArt
+                                : ""
 
                             fillMode: Image.PreserveAspectCrop
                             asynchronous: true
@@ -781,11 +594,8 @@ PanelWindow {
                             anchors.centerIn: parent
 
                             visible:
-                                (
-                                    root.activePlayer === null ||
-                                    root.activePlayer.trackArtUrl === ""
-                                ) &&
-                                root.lastMediaArt === ""
+                                root.activePlayer === null ||
+                                root.activePlayer.trackArtUrl === ""
 
                             text: "♪"
                             color: "#89b4fa"
@@ -810,14 +620,9 @@ PanelWindow {
                                     root.activePlayer !== null
                                     ? (
                                         root.activePlayer.trackTitle
-                                        || root.lastMediaTitle
                                         || "Unknown title"
                                     )
-                                    : (
-                                        root.lastMediaTitle !== ""
-                                        ? root.lastMediaTitle
-                                        : "No media"
-                                    )
+                                    : "No media"
 
                                 color: "#cdd6f4"
                                 font.pixelSize: 16
@@ -831,11 +636,10 @@ PanelWindow {
                                     root.activePlayer !== null
                                     ? (
                                         root.activePlayer.trackArtist
-                                        || root.lastMediaArtist
                                         || root.activePlayer.identity
                                         || ""
                                     )
-                                    : root.lastMediaArtist
+                                    : ""
 
                                 color: "#a6adc8"
                                 font.pixelSize: 12
@@ -907,7 +711,12 @@ PanelWindow {
                             cursorShape: Qt.PointingHandCursor
 
                             onClicked: {
-                                root.toggleOrResumeMedia()
+                                if (
+                                    root.activePlayer !== null &&
+                                    root.activePlayer.canTogglePlaying
+                                ) {
+                                    root.activePlayer.togglePlaying()
+                                }
                             }
                         }
                     }
@@ -947,115 +756,33 @@ PanelWindow {
                     }
                 }
 
-                // Progress / Seek
+                // Progress bar
                 Column {
                     width: parent.width
                     spacing: 6
 
-                    Item {
-                        id: seekArea
-
+                    Rectangle {
                         width: parent.width
-                        height: 14
+                        height: 5
+                        radius: 3
+                        color: "#313244"
 
                         Rectangle {
-                            anchors.verticalCenter: parent.verticalCenter
-
-                            width: parent.width
-                            height: 5
+                            height: parent.height
                             radius: 3
-                            color: "#313244"
-
-                            Rectangle {
-                                height: parent.height
-                                radius: 3
-                                color: "#89b4fa"
-
-                                width:
-                                    root.activePlayer !== null &&
-                                    root.activePlayer.lengthSupported &&
-                                    root.activePlayer.length > 0
-                                    ? parent.width *
-                                      Math.max(
-                                          0,
-                                          Math.min(
-                                              1,
-                                              root.activePlayer.position /
-                                              root.activePlayer.length
-                                          )
-                                      )
-                                    : 0
-                            }
-                        }
-
-                        Rectangle {
-                            width: 10
-                            height: 10
-                            radius: 5
                             color: "#89b4fa"
 
-                            visible:
+                            width:
                                 root.activePlayer !== null &&
                                 root.activePlayer.lengthSupported &&
                                 root.activePlayer.length > 0
-
-                            x:
-                                visible
-                                ? Math.max(
-                                    0,
-                                    Math.min(
-                                        seekArea.width - width,
-                                        (
-                                            root.activePlayer.position /
-                                            root.activePlayer.length
-                                        ) * seekArea.width - width / 2
-                                    )
+                                ? parent.width *
+                                  Math.min(
+                                      1,
+                                      root.activePlayer.position /
+                                      root.activePlayer.length
                                   )
                                 : 0
-
-                            anchors.verticalCenter: parent.verticalCenter
-                        }
-
-                        MouseArea {
-                            anchors.fill: parent
-                            cursorShape:
-                                root.activePlayer !== null &&
-                                root.activePlayer.canSeek &&
-                                root.activePlayer.positionSupported
-                                ? Qt.PointingHandCursor
-                                : Qt.ArrowCursor
-
-                            function seekTo(mouseX) {
-                                if (
-                                    root.activePlayer === null ||
-                                    !root.activePlayer.canSeek ||
-                                    !root.activePlayer.positionSupported ||
-                                    !root.activePlayer.lengthSupported ||
-                                    root.activePlayer.length <= 0
-                                ) {
-                                    return
-                                }
-
-                                let ratio = mouseX / width
-
-                                if (ratio < 0)
-                                    ratio = 0
-
-                                if (ratio > 1)
-                                    ratio = 1
-
-                                root.activePlayer.position =
-                                    ratio * root.activePlayer.length
-                            }
-
-                            onPressed: mouse => {
-                                seekTo(mouse.x)
-                            }
-
-                            onPositionChanged: mouse => {
-                                if (pressed)
-                                    seekTo(mouse.x)
-                            }
                         }
                     }
 
@@ -1066,8 +793,7 @@ PanelWindow {
                             width: parent.width / 2
 
                             text:
-                                root.activePlayer !== null &&
-                                root.activePlayer.positionSupported
+                                root.activePlayer !== null
                                 ? root.formatTime(
                                     root.activePlayer.position
                                   )

@@ -947,115 +947,33 @@ PanelWindow {
                     }
                 }
 
-                // Progress / Seek
+                // Progress bar
                 Column {
                     width: parent.width
                     spacing: 6
 
-                    Item {
-                        id: seekArea
-
+                    Rectangle {
                         width: parent.width
-                        height: 14
+                        height: 5
+                        radius: 3
+                        color: "#313244"
 
                         Rectangle {
-                            anchors.verticalCenter: parent.verticalCenter
-
-                            width: parent.width
-                            height: 5
+                            height: parent.height
                             radius: 3
-                            color: "#313244"
-
-                            Rectangle {
-                                height: parent.height
-                                radius: 3
-                                color: "#89b4fa"
-
-                                width:
-                                    root.activePlayer !== null &&
-                                    root.activePlayer.lengthSupported &&
-                                    root.activePlayer.length > 0
-                                    ? parent.width *
-                                      Math.max(
-                                          0,
-                                          Math.min(
-                                              1,
-                                              root.activePlayer.position /
-                                              root.activePlayer.length
-                                          )
-                                      )
-                                    : 0
-                            }
-                        }
-
-                        Rectangle {
-                            width: 10
-                            height: 10
-                            radius: 5
                             color: "#89b4fa"
 
-                            visible:
+                            width:
                                 root.activePlayer !== null &&
                                 root.activePlayer.lengthSupported &&
                                 root.activePlayer.length > 0
-
-                            x:
-                                visible
-                                ? Math.max(
-                                    0,
-                                    Math.min(
-                                        seekArea.width - width,
-                                        (
-                                            root.activePlayer.position /
-                                            root.activePlayer.length
-                                        ) * seekArea.width - width / 2
-                                    )
+                                ? parent.width *
+                                  Math.min(
+                                      1,
+                                      root.activePlayer.position /
+                                      root.activePlayer.length
                                   )
                                 : 0
-
-                            anchors.verticalCenter: parent.verticalCenter
-                        }
-
-                        MouseArea {
-                            anchors.fill: parent
-                            cursorShape:
-                                root.activePlayer !== null &&
-                                root.activePlayer.canSeek &&
-                                root.activePlayer.positionSupported
-                                ? Qt.PointingHandCursor
-                                : Qt.ArrowCursor
-
-                            function seekTo(mouseX) {
-                                if (
-                                    root.activePlayer === null ||
-                                    !root.activePlayer.canSeek ||
-                                    !root.activePlayer.positionSupported ||
-                                    !root.activePlayer.lengthSupported ||
-                                    root.activePlayer.length <= 0
-                                ) {
-                                    return
-                                }
-
-                                let ratio = mouseX / width
-
-                                if (ratio < 0)
-                                    ratio = 0
-
-                                if (ratio > 1)
-                                    ratio = 1
-
-                                root.activePlayer.position =
-                                    ratio * root.activePlayer.length
-                            }
-
-                            onPressed: mouse => {
-                                seekTo(mouse.x)
-                            }
-
-                            onPositionChanged: mouse => {
-                                if (pressed)
-                                    seekTo(mouse.x)
-                            }
                         }
                     }
 
@@ -1066,8 +984,7 @@ PanelWindow {
                             width: parent.width / 2
 
                             text:
-                                root.activePlayer !== null &&
-                                root.activePlayer.positionSupported
+                                root.activePlayer !== null
                                 ? root.formatTime(
                                     root.activePlayer.position
                                   )

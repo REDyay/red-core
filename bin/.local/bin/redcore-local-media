@@ -1,0 +1,305 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+INPUT="${1:-}"
+MODE="${2:-}"
+START_POSITION="${3:-0}"
+
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/red-core"
+PLAYLIST="$STATE_DIR/local-playlist.m3u"
+SOCKET="$STATE_DIR/mpv.sock"
+LOCK="$STATE_DIR/local-player.lock"
+
+mkdir -p "$STATE_DIR"
+
+[ -n "$INPUT" ] || exit 1
+
+# ------------------------------------------------------------
+# Convert file:// URI or normal path to an absolute local path
+# ------------------------------------------------------------
+
+FILE="$(
+python3 - "$INPUT" <<'PY'
+import sys
+from pathlib import Path
+from urllib.parse import urlparse, unquote
+
+value = sys.argv[1]
+
+if value.startswith("file://"):
+    value = unquote(urlparse(value).path)
+
+print(Path(value).expanduser().resolve())
+PY
+)"
+
+[ -f "$FILE" ] || {
+    echo "Red Core: audio file not found: $FILE" >&2
+    exit 1
+}
+
+# ------------------------------------------------------------
+# If no mode was supplied, keep the saved Local playback mode
+# ------------------------------------------------------------
+
+if [ -z "$MODE" ]; then
+    MODE="$(
+        redcore-media-state get 2>/dev/null |
+        python3 -c '
+import json, sys
+
+try:
+    data = json.load(sys.stdin)
+    mode = data.get("mode", "normal")
+except Exception:
+    mode = "normal"
+
+if mode not in {"normal", "track", "playlist", "shuffle"}:
+    mode = "normal"
+
+print(mode)
+' 2>/dev/null || printf '%s\n' normal
+    )"
+fi
+
+case "$MODE" in
+    normal|track|playlist|shuffle)
+        ;;
+    *)
+        MODE="normal"
+        ;;
+esac
+
+DIR="$(dirname "$FILE")"
+
+# ------------------------------------------------------------
+# Build a simple playlist from the selected file's directory.
+# Library/album management will be handled later by Music Center.
+# ------------------------------------------------------------
+
+INDEX="$(
+python3 - "$DIR" "$FILE" "$PLAYLIST" <<'PY'
+import sys
+from pathlib import Path
+
+directory = Path(sys.argv[1])
+current = Path(sys.argv[2]).resolve()
+playlist = Path(sys.argv[3])
+
+extensions = {
+    ".mp3",
+    ".flac",
+    ".ogg",
+    ".opus",
+    ".m4a",
+    ".aac",
+    ".wav",
+    ".wma",
+}
+
+files = sorted(
+    (
+        item.resolve()
+        for item in directory.iterdir()
+        if item.is_file()
+        and item.suffix.lower() in extensions
+    ),
+    key=lambda item: item.name.casefold()
+)
+
+if current not in files:
+    files.insert(0, current)
+
+playlist.write_text(
+    "".join(
+        item.as_uri() + "\n"
+        for item in files
+    ),
+    encoding="utf-8",
+)
+
+print(files.index(current))
+PY
+)"
+
+# ------------------------------------------------------------
+# Reuse an existing Red Core Local session if possible.
+#
+# This replaces its playlist and selects the file the user opened,
+# instead of creating another mpv process.
+# ------------------------------------------------------------
+
+try_existing_player() {
+python3 - "$SOCKET" "$PLAYLIST" "$INDEX" <<'PY'
+import json
+import socket
+import sys
+import time
+from pathlib import Path
+
+socket_path = Path(sys.argv[1])
+playlist = str(Path(sys.argv[2]).resolve())
+index = int(sys.argv[3])
+
+commands = [
+    ["loadlist", playlist, "replace"],
+    ["playlist-play-index", index],
+]
+
+# Socket can briefly disappear during an mpv state transition,
+# so allow a very small retry window.
+for _ in range(12):
+    if socket_path.exists():
+        try:
+            sock = socket.socket(
+                socket.AF_UNIX,
+                socket.SOCK_STREAM,
+            )
+
+            sock.connect(str(socket_path))
+
+            for request_id, command in enumerate(commands, 1):
+                message = {
+                    "command": command,
+                    "request_id": request_id,
+                }
+
+                sock.sendall(
+                    (
+                        json.dumps(message)
+                        + "\n"
+                    ).encode()
+                )
+
+            sock.close()
+            raise SystemExit(0)
+
+        except OSError:
+            pass
+
+    time.sleep(0.05)
+
+raise SystemExit(1)
+PY
+}
+
+if try_existing_player; then
+    exit 0
+fi
+
+# ------------------------------------------------------------
+# No usable Red Core Local session exists.
+# Create exactly one.
+# ------------------------------------------------------------
+
+exec 9>"$LOCK"
+
+if ! flock -n 9; then
+    # Another invocation may currently be creating the socket.
+    # Give it one more short chance, but NEVER launch a second player.
+    if try_existing_player; then
+        exit 0
+    fi
+
+    echo "Red Core: Local Music session is already starting." >&2
+    exit 0
+fi
+
+rm -f "$SOCKET"
+
+cleanup() {
+    rm -f "$SOCKET"
+}
+
+trap cleanup EXIT
+
+OPTIONS=(
+    "--no-terminal"
+    "--input-ipc-server=$SOCKET"
+    "--playlist=$PLAYLIST"
+    "--playlist-start=$INDEX"
+    "--loop-file=no"
+    "--loop-playlist=no"
+)
+
+case "$MODE" in
+    normal)
+        ;;
+
+    track)
+        OPTIONS+=(
+            "--loop-file=inf"
+        )
+        ;;
+
+    playlist)
+        OPTIONS+=(
+            "--loop-playlist=inf"
+        )
+        ;;
+
+    shuffle)
+        OPTIONS+=(
+            "--shuffle"
+            "--loop-playlist=inf"
+        )
+        ;;
+esac
+
+mpv "${OPTIONS[@]}" &
+MPV_PID=$!
+
+# ------------------------------------------------------------
+# Restore a saved position only when creating a new session.
+# ------------------------------------------------------------
+
+python3 - "$SOCKET" "$START_POSITION" <<'PY'
+import json
+import socket
+import sys
+import time
+from pathlib import Path
+
+socket_path = Path(sys.argv[1])
+
+try:
+    position = float(sys.argv[2])
+except Exception:
+    position = 0.0
+
+if position <= 0:
+    raise SystemExit(0)
+
+for _ in range(60):
+    if socket_path.exists():
+        try:
+            sock = socket.socket(
+                socket.AF_UNIX,
+                socket.SOCK_STREAM,
+            )
+
+            sock.connect(str(socket_path))
+
+            sock.sendall(
+                (
+                    json.dumps({
+                        "command": [
+                            "set_property",
+                            "time-pos",
+                            position,
+                        ]
+                    })
+                    + "\n"
+                ).encode()
+            )
+
+            sock.close()
+            break
+
+        except OSError:
+            pass
+
+    time.sleep(0.05)
+PY
+
+wait "$MPV_PID"

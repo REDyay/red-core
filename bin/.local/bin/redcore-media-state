@@ -1,0 +1,104 @@
+#!/usr/bin/env python3
+
+import json
+import os
+import sys
+from pathlib import Path
+
+STATE_DIR = Path.home() / ".local/state/red-core"
+STATE_FILE = STATE_DIR / "local-media.json"
+
+STATE_DIR.mkdir(parents=True, exist_ok=True)
+
+DEFAULT = {
+    "uri": "",
+    "title": "",
+    "artist": "",
+    "art": "",
+    "position": 0.0,
+    "mode": "normal",
+}
+
+VALID_MODES = {
+    "normal",
+    "track",
+    "playlist",
+    "shuffle",
+}
+
+def load():
+    if not STATE_FILE.exists():
+        return DEFAULT.copy()
+
+    try:
+        data = json.loads(
+            STATE_FILE.read_text(encoding="utf-8")
+        )
+
+        result = DEFAULT.copy()
+        result.update(data)
+
+        if result["mode"] not in VALID_MODES:
+            result["mode"] = "normal"
+
+        return result
+
+    except Exception:
+        return DEFAULT.copy()
+
+def save(data):
+    temp = STATE_FILE.with_suffix(".json.tmp")
+
+    temp.write_text(
+        json.dumps(
+            data,
+            ensure_ascii=False,
+            indent=2
+        ),
+        encoding="utf-8"
+    )
+
+    os.replace(temp, STATE_FILE)
+
+command = (
+    sys.argv[1]
+    if len(sys.argv) > 1
+    else "get"
+)
+
+if command == "get":
+    print(
+        json.dumps(
+            load(),
+            ensure_ascii=False
+        )
+    )
+
+elif command == "save":
+    if len(sys.argv) < 8:
+        raise SystemExit(1)
+
+    try:
+        position = max(
+            0.0,
+            float(sys.argv[6])
+        )
+    except Exception:
+        position = 0.0
+
+    mode = sys.argv[7]
+
+    if mode not in VALID_MODES:
+        mode = "normal"
+
+    save({
+        "uri": sys.argv[2],
+        "title": sys.argv[3],
+        "artist": sys.argv[4],
+        "art": sys.argv[5],
+        "position": position,
+        "mode": mode,
+    })
+
+else:
+    raise SystemExit(1)

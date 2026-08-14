@@ -21,11 +21,169 @@ PanelWindow {
     // Last actually used media player.
     // We keep its metadata even if the player disappears.
     property var activePlayer: null
+
+    // Current/last visible MPRIS media.
     property string lastPlayerDbusName: ""
     property string lastMediaTitle: ""
     property string lastMediaArtist: ""
     property string lastMediaArt: ""
     property string lastMediaUri: ""
+
+    // Persistent LOCAL music session.
+    // Online players must NEVER overwrite these.
+    property string lastLocalUri: ""
+    property string lastLocalTitle: ""
+    property string lastLocalArtist: ""
+    property string lastLocalArt: ""
+    property real lastLocalPosition: 0
+    property string localPlaybackMode: "normal"
+
+    // Empty = automatic player selection.
+    property string pinnedPlayerDbusName: ""
+
+    // Used to detect the actual Paused -> Playing transition.
+    property var playerPlayingSnapshot: ({})
+
+    // Keep the current MPRIS source stable during short
+    // track transitions, especially browser media sessions.
+    property string mediaTransitionDbusName: ""
+    property double mediaTransitionUntil: 0
+
+    // Local queue information.
+    property int localQueueCount: 0
+    property string localQueueCurrent: ""
+    property string localQueueNext: ""
+
+    function currentPlaybackMode() {
+        const player = root.activePlayer
+
+        if (player !== null) {
+            if (
+                player.shuffleSupported &&
+                player.shuffle
+            ) {
+                return "shuffle"
+            }
+
+            if (player.loopSupported) {
+                if (player.loopState === MprisLoopState.Track)
+                    return "track"
+
+                if (player.loopState === MprisLoopState.Playlist)
+                    return "playlist"
+            }
+
+            return "normal"
+        }
+
+        return root.localPlaybackMode
+    }
+
+    function playbackModeIcon() {
+        const mode = root.currentPlaybackMode()
+
+        if (mode === "track")
+            return "↻1"
+
+        if (mode === "playlist")
+            return "↻"
+
+        if (mode === "shuffle")
+            return "⇄"
+
+        return "▶"
+    }
+
+    function applyPlaybackMode(mode) {
+        const player = root.activePlayer
+
+        // Store this as Local Music preference only when we are
+        // controlling Local Music or there is no live player.
+        if (
+            player === null ||
+            root.playerIsLocal(player)
+        ) {
+            root.localPlaybackMode = mode
+        }
+
+        // No live MPRIS player:
+        // keep the mode as the preferred mode for local fallback.
+        if (player === null)
+            return
+
+        // Always disable shuffle first when leaving shuffle mode.
+        if (
+            player.shuffleSupported &&
+            mode !== "shuffle"
+        ) {
+            player.shuffle = false
+        }
+
+        if (mode === "normal") {
+            if (player.loopSupported)
+                player.loopState = MprisLoopState.None
+
+            return
+        }
+
+        if (mode === "track") {
+            if (player.loopSupported)
+                player.loopState = MprisLoopState.Track
+
+            return
+        }
+
+        if (mode === "playlist") {
+            if (player.loopSupported)
+                player.loopState = MprisLoopState.Playlist
+
+            return
+        }
+
+        if (mode === "shuffle") {
+            if (player.loopSupported)
+                player.loopState = MprisLoopState.Playlist
+
+            if (player.shuffleSupported)
+                player.shuffle = true
+        }
+    }
+
+    function nextPlaybackMode() {
+        const player = root.activePlayer
+        const current = root.currentPlaybackMode()
+
+        let modes = ["normal"]
+
+        if (
+            player === null ||
+            player.loopSupported
+        ) {
+            modes.push("track")
+            modes.push("playlist")
+        }
+
+        if (
+            player === null ||
+            player.shuffleSupported
+        ) {
+            modes.push("shuffle")
+        }
+
+        let index = modes.indexOf(current)
+
+        if (index < 0)
+            index = 0
+
+        const next =
+            modes[(index + 1) % modes.length]
+
+        root.applyPlaybackMode(next)
+    }
+
+    function localPlaybackModeLabel() {
+        return root.currentPlaybackMode()
+    }
 
     property int cpuUsage: 0
     property var cpuTemp: null
@@ -64,17 +222,198 @@ PanelWindow {
     // MEDIA PLAYER TRACKING
     // =========================
 
+    function playerUri(player) {
+        if (player === null)
+            return ""
+
+        try {
+            const metadata = player.metadata
+
+            if (
+                metadata !== null &&
+                metadata !== undefined
+            ) {
+                const uri = metadata["xesam:url"]
+
+                if (
+                    uri !== undefined &&
+                    uri !== null
+                ) {
+                    return String(uri)
+                }
+            }
+        } catch (error) {
+        }
+
+        return ""
+    }
+
+    function playerIsLocal(player) {
+        const uri = root.playerUri(player)
+
+        return (
+            uri !== "" &&
+            uri.startsWith("file://")
+        )
+    }
+
+    function findPlayer(dbusName) {
+        if (dbusName === "")
+            return null
+
+        const players = Mpris.players.values
+
+        for (let i = 0; i < players.length; i++) {
+            if (players[i].dbusName === dbusName)
+                return players[i]
+        }
+
+        return null
+    }
+
+    function playerUsable(player) {
+        if (player === null)
+            return false
+
+        return (
+            player.isPlaying ||
+            player.canTogglePlaying ||
+            player.canPlay ||
+            player.trackTitle !== ""
+        )
+    }
+
+    function pauseOtherPlayers(exceptDbusName) {
+        const players = Mpris.players.values
+
+        for (let i = 0; i < players.length; i++) {
+            const player = players[i]
+
+            if (
+                player.dbusName === exceptDbusName ||
+                !player.isPlaying
+            ) {
+                continue
+            }
+
+            try {
+                if (player.canPause) {
+                    player.pause()
+                } else if (player.canControl) {
+                    player.stop()
+                }
+            } catch (error) {
+                console.log(
+                    "Could not silence media source:",
+                    player.dbusName,
+                    error
+                )
+            }
+        }
+    }
+
+    function bestLocalPlayer() {
+        const players = Mpris.players.values
+        let fallback = null
+
+        // Prefer the Local player that is really playing.
+        for (let i = 0; i < players.length; i++) {
+            const player = players[i]
+
+            if (!root.playerIsLocal(player))
+                continue
+
+            if (player.isPlaying)
+                return player
+
+            if (
+                root.activePlayer !== null &&
+                player.dbusName === root.activePlayer.dbusName
+            ) {
+                fallback = player
+            } else if (fallback === null) {
+                fallback = player
+            }
+        }
+
+        return fallback
+    }
+
+    function activateMediaPlayer(player) {
+        if (player === null)
+            return
+
+        // Red Core uses exclusive playback:
+        // selecting one source pauses every other source.
+        root.pauseOtherPlayers(player.dbusName)
+
+        root.pinnedPlayerDbusName =
+            player.dbusName
+
+        root.rememberPlayer(player)
+
+        if (
+            !player.isPlaying &&
+            player.canPlay
+        ) {
+            player.play()
+        }
+    }
+
+    function logicalMediaSources() {
+        const players = Mpris.players.values
+        let sources = []
+
+        // All file:// MPRIS players represent ONE logical
+        // Red Core Local Music source.
+        const local =
+            root.bestLocalPlayer()
+
+        if (local !== null)
+            sources.push(local)
+
+        for (let i = 0; i < players.length; i++) {
+            const player = players[i]
+
+            if (!root.playerUsable(player))
+                continue
+
+            if (root.playerIsLocal(player))
+                continue
+
+            sources.push(player)
+        }
+
+        return sources
+    }
+
+    function livePlayerCount() {
+        const players = Mpris.players.values
+        let count = 0
+
+        for (let i = 0; i < players.length; i++) {
+            if (root.playerUsable(players[i]))
+                count++
+        }
+
+        return count
+    }
+
     function rememberPlayer(player) {
         if (player === null)
             return
 
-        root.activePlayer = player
-        root.lastPlayerDbusName = player.dbusName || ""
+        root.mediaTransitionDbusName = ""
+        root.mediaTransitionUntil = 0
 
-        if (player.trackTitle)
-            root.lastMediaTitle = player.trackTitle
-        else if (player.identity)
-            root.lastMediaTitle = player.identity
+        root.activePlayer = player
+        root.lastPlayerDbusName =
+            player.dbusName || ""
+
+        root.lastMediaTitle =
+            player.trackTitle ||
+            player.identity ||
+            ""
 
         root.lastMediaArtist =
             player.trackArtist ||
@@ -84,73 +423,431 @@ PanelWindow {
         root.lastMediaArt =
             player.trackArtUrl || ""
 
-        try {
-            const metadata = player.metadata
+        const uri = root.playerUri(player)
 
-            if (metadata) {
-                const uri = metadata["xesam:url"]
+        if (uri !== "")
+            root.lastMediaUri = uri
+
+        // Online players must NEVER overwrite Local Music.
+        if (uri.startsWith("file://")) {
+            const trackChanged =
+                uri !== root.lastLocalUri
+
+            root.lastLocalUri = uri
+
+            root.lastLocalTitle =
+                player.trackTitle ||
+                root.lastLocalTitle
+
+            root.lastLocalArtist =
+                player.trackArtist ||
+                root.lastLocalArtist
+
+            root.lastLocalArt =
+                player.trackArtUrl ||
+                root.lastLocalArt
+
+            if (trackChanged) {
+                root.lastLocalPosition = 0
+            } else if (player.positionSupported) {
+                let position =
+                    Math.max(
+                        0,
+                        player.position
+                    )
 
                 if (
-                    uri !== undefined &&
-                    uri !== null &&
-                    String(uri) !== ""
+                    player.lengthSupported &&
+                    player.length > 0 &&
+                    position >=
+                        Math.max(
+                            0,
+                            player.length - 2.5
+                        )
                 ) {
-                    root.lastMediaUri = String(uri)
+                    position = 0
                 }
+
+                root.lastLocalPosition =
+                    position
             }
-        } catch (error) {
-            console.log(
-                "Could not read media URI:",
-                error
-            )
+        }
+    }
+
+    function resumeLocalSession() {
+        // If a Local MPRIS session already exists,
+        // reuse it instead of starting another mpv.
+        const local =
+            root.bestLocalPlayer()
+
+        if (local !== null) {
+            root.activateMediaPlayer(local)
+            return
+        }
+
+        if (root.lastLocalUri === "")
+            return
+
+        // No live local player:
+        // pause online media before starting Local Music.
+        root.pauseOtherPlayers("")
+
+        root.pinnedPlayerDbusName = ""
+
+        if (!resumeLocalMedia.running) {
+            resumeLocalMedia.command = [
+                "redcore-local-media",
+                root.lastLocalUri,
+                root.localPlaybackMode,
+                String(root.lastLocalPosition)
+            ]
+
+            resumeLocalMedia.running = true
         }
     }
 
     function toggleOrResumeMedia() {
-        // Only control activePlayer if it is still alive in MPRIS.
         if (root.activePlayer !== null) {
-            const players = Mpris.players.values
-            let playerAlive = false
-
-            for (let i = 0; i < players.length; i++) {
-                if (
-                    players[i].dbusName ===
+            const live =
+                root.findPlayer(
                     root.activePlayer.dbusName
-                ) {
-                    playerAlive = true
-                    break
-                }
-            }
+                )
 
             if (
-                playerAlive &&
-                root.activePlayer.canTogglePlaying
+                live !== null &&
+                live.canTogglePlaying
             ) {
-                root.activePlayer.togglePlaying()
+                // When resuming this source, first pause
+                // any other source that may be playing.
+                if (!live.isPlaying) {
+                    root.pauseOtherPlayers(
+                        live.dbusName
+                    )
+                }
+
+                live.togglePlaying()
                 return
             }
         }
 
-        // Reopen only remembered LOCAL files.
-        if (
-            root.lastMediaUri !== "" &&
-            root.lastMediaUri.startsWith("file://")
-        ) {
-            if (!resumeLocalMedia.running) {
-                resumeLocalMedia.command = [
-                    "mpv",
-                    "--no-terminal",
-                    "--",
-                    root.lastMediaUri
-                ]
+        root.resumeLocalSession()
+    }
 
-                resumeLocalMedia.running = true
+    function mediaSourceLabel() {
+        if (root.activePlayer !== null) {
+            if (
+                root.playerIsLocal(
+                    root.activePlayer
+                )
+            ) {
+                return "Local"
+            }
+
+            return (
+                root.activePlayer.identity ||
+                "Media"
+            )
+        }
+
+        if (root.lastLocalUri !== "")
+            return "Local"
+
+        return "No media"
+    }
+
+    function cycleMediaPlayer() {
+        const sources =
+            root.logicalMediaSources()
+
+        if (sources.length === 0)
+            return
+
+        if (sources.length === 1) {
+            root.activateMediaPlayer(
+                sources[0]
+            )
+            return
+        }
+
+        let currentIndex = -1
+
+        for (let i = 0; i < sources.length; i++) {
+            if (root.activePlayer === null)
+                break
+
+            const currentLocal =
+                root.playerIsLocal(
+                    root.activePlayer
+                )
+
+            const candidateLocal =
+                root.playerIsLocal(
+                    sources[i]
+                )
+
+            if (
+                currentLocal &&
+                candidateLocal
+            ) {
+                currentIndex = i
+                break
+            }
+
+            if (
+                !currentLocal &&
+                sources[i].dbusName ===
+                root.activePlayer.dbusName
+            ) {
+                currentIndex = i
+                break
+            }
+        }
+
+        const nextIndex =
+            (currentIndex + 1) %
+            sources.length
+
+        root.activateMediaPlayer(
+            sources[nextIndex]
+        )
+    }
+
+    function saveLocalMediaState() {
+        if (
+            root.activePlayer !== null &&
+            root.playerIsLocal(
+                root.activePlayer
+            )
+        ) {
+            const uri =
+                root.playerUri(
+                    root.activePlayer
+                )
+
+            if (uri.startsWith("file://")) {
+                const trackChanged =
+                    uri !== root.lastLocalUri
+
+                root.lastLocalUri = uri
+
+                root.lastLocalTitle =
+                    root.activePlayer.trackTitle ||
+                    root.lastLocalTitle
+
+                root.lastLocalArtist =
+                    root.activePlayer.trackArtist ||
+                    root.lastLocalArtist
+
+                root.lastLocalArt =
+                    root.activePlayer.trackArtUrl ||
+                    root.lastLocalArt
+
+                if (trackChanged) {
+                    root.lastLocalPosition = 0
+                } else if (
+                    root.activePlayer.positionSupported
+                ) {
+                    let position =
+                        Math.max(
+                            0,
+                            root.activePlayer.position
+                        )
+
+                    if (
+                        root.activePlayer.lengthSupported &&
+                        root.activePlayer.length > 0 &&
+                        position >=
+                            Math.max(
+                                0,
+                                root.activePlayer.length -
+                                2.5
+                            )
+                    ) {
+                        position = 0
+                    }
+
+                    root.lastLocalPosition =
+                        position
+                }
+            }
+        }
+
+        if (
+            root.lastLocalUri === "" ||
+            localStateSave.running
+        ) {
+            return
+        }
+
+        localStateSave.command = [
+            "redcore-media-state",
+            "save",
+            root.lastLocalUri,
+            root.lastLocalTitle,
+            root.lastLocalArtist,
+            root.lastLocalArt,
+            String(root.lastLocalPosition),
+            root.localPlaybackMode
+        ]
+
+        localStateSave.running = true
+    }
+
+    Process {
+        id: resumeLocalMedia
+    }
+
+    // Load Local Music state once when Quickshell starts.
+    Process {
+        id: localStateLoad
+
+        running: true
+        command: [
+            "redcore-media-state",
+            "get"
+        ]
+
+        stdout: StdioCollector {
+            onStreamFinished: {
+                try {
+                    const data =
+                        JSON.parse(this.text)
+
+                    root.lastLocalUri =
+                        data.uri || ""
+
+                    root.lastLocalTitle =
+                        data.title || ""
+
+                    root.lastLocalArtist =
+                        data.artist || ""
+
+                    root.lastLocalArt =
+                        data.art || ""
+
+                    root.lastLocalPosition =
+                        Number(data.position || 0)
+
+                    const mode =
+                        data.mode || "normal"
+
+                    if (
+                        mode === "normal" ||
+                        mode === "track" ||
+                        mode === "playlist" ||
+                        mode === "shuffle"
+                    ) {
+                        root.localPlaybackMode =
+                            mode
+                    }
+
+                    // Display remembered local music
+                    // without automatically starting it.
+                    if (
+                        root.activePlayer === null &&
+                        root.lastLocalUri !== ""
+                    ) {
+                        root.lastMediaUri =
+                            root.lastLocalUri
+
+                        root.lastMediaTitle =
+                            root.lastLocalTitle
+
+                        root.lastMediaArtist =
+                            root.lastLocalArtist
+
+                        root.lastMediaArt =
+                            root.lastLocalArt
+                    }
+                } catch (error) {
+                    console.log(
+                        "Could not load Local Media state:",
+                        error
+                    )
+                }
             }
         }
     }
 
     Process {
-        id: resumeLocalMedia
+        id: localStateSave
+    }
+
+    Process {
+        id: localQueueRead
+
+        stdout: StdioCollector {
+            onStreamFinished: {
+                try {
+                    const data =
+                        JSON.parse(this.text)
+
+                    root.localQueueCount =
+                        Number(
+                            data.count || 0
+                        )
+
+                    root.localQueueCurrent =
+                        data.current || ""
+
+                    root.localQueueNext =
+                        data.next || ""
+
+                } catch (error) {
+                    root.localQueueCount = 0
+                    root.localQueueCurrent = ""
+                    root.localQueueNext = ""
+                }
+            }
+        }
+    }
+
+    Timer {
+        interval: 1000
+
+        running:
+            mediaPopup.visible &&
+            root.activePlayer !== null &&
+            root.playerIsLocal(
+                root.activePlayer
+            )
+
+        repeat: true
+        triggeredOnStart: true
+
+        onTriggered: {
+            if (
+                root.activePlayer === null ||
+                !root.playerIsLocal(
+                    root.activePlayer
+                )
+            ) {
+                root.localQueueCount = 0
+                return
+            }
+
+            if (!localQueueRead.running) {
+                localQueueRead.command = [
+                    "redcore-local-queue",
+                    root.playerUri(
+                        root.activePlayer
+                    )
+                ]
+
+                localQueueRead.running = true
+            }
+        }
+    }
+
+    // Persist Local position without constantly writing to disk.
+    Timer {
+        interval: 5000
+        running: true
+        repeat: true
+
+        onTriggered: {
+            root.saveLocalMediaState()
+        }
     }
 
     Timer {
@@ -162,54 +859,252 @@ PanelWindow {
         triggeredOnStart: true
 
         onTriggered: {
-            const players = Mpris.players.values
+            const players =
+                Mpris.players.values
 
-            // First: keep the last-used player if it still exists.
-            let remembered = null
+            const previous =
+                root.playerPlayingSnapshot || ({})
 
-            for (let i = 0; i < players.length; i++) {
+            let snapshot = ({})
+            let playing = []
+            let started = []
+
+            for (
+                let i = 0;
+                i < players.length;
+                i++
+            ) {
                 const player = players[i]
 
-                if (
-                    player.dbusName ===
-                    root.lastPlayerDbusName
-                ) {
-                    remembered = player
-                    break
+                const name =
+                    player.dbusName || ""
+
+                const nowPlaying =
+                    player.isPlaying
+
+                snapshot[name] =
+                    nowPlaying
+
+                if (nowPlaying) {
+                    playing.push(player)
+
+                    // This source actually changed
+                    // Paused/Stopped -> Playing.
+                    if (previous[name] !== true) {
+                        started.push(player)
+                    }
                 }
             }
 
-            // If our remembered player is actively playing,
-            // keep it and refresh its metadata.
+            root.playerPlayingSnapshot =
+                snapshot
+
+            // ---------------------------------
+            // A source has just started.
+            // The newest started source wins.
+            // ---------------------------------
+            if (started.length > 0) {
+                let chosen =
+                    started[
+                        started.length - 1
+                    ]
+
+                // If multiple appeared in the same
+                // tick, prefer the one different
+                // from the previous active source.
+                if (
+                    started.length > 1 &&
+                    root.activePlayer !== null
+                ) {
+                    for (
+                        let i = started.length - 1;
+                        i >= 0;
+                        i--
+                    ) {
+                        if (
+                            started[i].dbusName !==
+                            root.activePlayer.dbusName
+                        ) {
+                            chosen = started[i]
+                            break
+                        }
+                    }
+                }
+
+                root.pauseOtherPlayers(
+                    chosen.dbusName
+                )
+
+                root.pinnedPlayerDbusName =
+                    chosen.dbusName
+
+                root.rememberPlayer(chosen)
+                return
+            }
+
+            // ---------------------------------
+            // Something is already playing.
+            // Keep active/pinned player if possible.
+            // ---------------------------------
+            if (playing.length > 0) {
+                let chosen = null
+
+                if (
+                    root.pinnedPlayerDbusName !== ""
+                ) {
+                    for (
+                        let i = 0;
+                        i < playing.length;
+                        i++
+                    ) {
+                        if (
+                            playing[i].dbusName ===
+                            root.pinnedPlayerDbusName
+                        ) {
+                            chosen = playing[i]
+                            break
+                        }
+                    }
+                }
+
+                if (
+                    chosen === null &&
+                    root.activePlayer !== null
+                ) {
+                    for (
+                        let i = 0;
+                        i < playing.length;
+                        i++
+                    ) {
+                        if (
+                            playing[i].dbusName ===
+                            root.activePlayer.dbusName
+                        ) {
+                            chosen = playing[i]
+                            break
+                        }
+                    }
+                }
+
+                if (chosen === null)
+                    chosen = playing[0]
+
+                if (playing.length > 1) {
+                    root.pauseOtherPlayers(
+                        chosen.dbusName
+                    )
+                }
+
+                root.rememberPlayer(chosen)
+                return
+            }
+
+            // ---------------------------------
+            // Nothing playing: selected session.
+            //
+            // Browsers may briefly expose an empty/stopped
+            // MPRIS state while changing tracks.
+            // Do NOT jump to Local immediately.
+            // ---------------------------------
+            if (
+                root.pinnedPlayerDbusName !== ""
+            ) {
+                const pinned =
+                    root.findPlayer(
+                        root.pinnedPlayerDbusName
+                    )
+
+                if (pinned !== null) {
+                    if (
+                        root.playerUsable(pinned)
+                    ) {
+                        root.rememberPlayer(pinned)
+                        return
+                    }
+
+                    const now = Date.now()
+
+                    if (
+                        root.mediaTransitionDbusName !==
+                        pinned.dbusName
+                    ) {
+                        root.mediaTransitionDbusName =
+                            pinned.dbusName
+
+                        root.mediaTransitionUntil =
+                            now + 2500
+                    }
+
+                    if (
+                        now <
+                        root.mediaTransitionUntil
+                    ) {
+                        // Keep the same source selected.
+                        // We intentionally do NOT call
+                        // rememberPlayer here because its
+                        // metadata may be temporarily empty.
+                        root.activePlayer = pinned
+                        return
+                    }
+                }
+
+                root.mediaTransitionDbusName = ""
+                root.mediaTransitionUntil = 0
+                root.pinnedPlayerDbusName = ""
+            }
+
+            // ---------------------------------
+            // Last paused session.
+            // ---------------------------------
+            const remembered =
+                root.findPlayer(
+                    root.lastPlayerDbusName
+                )
+
             if (
                 remembered !== null &&
-                remembered.isPlaying
+                root.playerUsable(remembered)
             ) {
                 root.rememberPlayer(remembered)
                 return
             }
 
-            // Otherwise look for a player that is actually playing.
-            for (let i = 0; i < players.length; i++) {
-                const player = players[i]
-
-                if (player.isPlaying) {
-                    root.rememberPlayer(player)
+            // ---------------------------------
+            // Any valid paused MPRIS session.
+            // ---------------------------------
+            for (
+                let i = 0;
+                i < players.length;
+                i++
+            ) {
+                if (
+                    root.playerUsable(players[i])
+                ) {
+                    root.rememberPlayer(
+                        players[i]
+                    )
                     return
                 }
             }
 
-            // Nobody is playing.
-            // Keep our remembered player if it still exists.
-            if (remembered !== null) {
-                root.activePlayer = remembered
-                root.rememberPlayer(remembered)
-                return
-            }
-
-            // Last player disappeared (for example mpv after EOF).
-            // Keep its saved metadata, but don't jump to Brave/etc.
+            // ---------------------------------
+            // Nothing live: persistent Local fallback.
+            // ---------------------------------
             root.activePlayer = null
+
+            if (root.lastLocalUri !== "") {
+                root.lastMediaUri =
+                    root.lastLocalUri
+
+                root.lastMediaTitle =
+                    root.lastLocalTitle
+
+                root.lastMediaArtist =
+                    root.lastLocalArtist
+
+                root.lastMediaArt =
+                    root.lastLocalArt
+            }
         }
     }
 
@@ -474,52 +1369,178 @@ PanelWindow {
             Item {
                 id: mediaButton
 
-                width: 205
+                width: 230
                 height: 32
 
                 Row {
-                    id: mediaContent
                     anchors.centerIn: parent
-                    spacing: 8
+                    spacing: 6
 
-                    Text {
-                        text:
-                            root.activePlayer === null
-                            ? "♪"
-                            : root.activePlayer.isPlaying
-                            ? "▶"
-                            : "Ⅱ"
+                    // Previous
+                    Rectangle {
+                        width: 26
+                        height: 26
+                        radius: 8
+                        color: "#313244"
 
+                        opacity:
+                            root.activePlayer !== null &&
+                            root.activePlayer.canGoPrevious
+                            ? 1.0
+                            : 0.35
+
+                        Text {
+                            anchors.centerIn: parent
+                            text: "◀"
+                            color: "#cdd6f4"
+                            font.pixelSize: 11
+                        }
+
+                        MouseArea {
+                            anchors.fill: parent
+
+                            cursorShape:
+                                root.activePlayer !== null &&
+                                root.activePlayer.canGoPrevious
+                                ? Qt.PointingHandCursor
+                                : Qt.ArrowCursor
+
+                            onClicked: {
+                                if (
+                                    root.activePlayer !== null &&
+                                    root.activePlayer.canGoPrevious
+                                ) {
+                                    root.activePlayer.previous()
+                                }
+                            }
+                        }
+                    }
+
+                    // Play / Pause
+                    Rectangle {
+                        width: 30
+                        height: 28
+                        radius: 8
                         color: "#89b4fa"
-                        font.pixelSize: 13
+
+                        Text {
+                            anchors.centerIn: parent
+
+                            text:
+                                root.activePlayer !== null &&
+                                root.activePlayer.isPlaying
+                                ? "Ⅱ"
+                                : "▶"
+
+                            color: "#11111b"
+                            font.pixelSize: 12
+                        }
+
+                        MouseArea {
+                            anchors.fill: parent
+                            cursorShape: Qt.PointingHandCursor
+
+                            onClicked: {
+                                root.toggleOrResumeMedia()
+                            }
+                        }
                     }
 
-                    Text {
-                        width: 180
-                        elide: Text.ElideRight
+                    // Next
+                    Rectangle {
+                        width: 26
+                        height: 26
+                        radius: 8
+                        color: "#313244"
 
-                        text:
-                            root.activePlayer === null
-                            ? "No media"
-                            : root.activePlayer.trackTitle
-                              || root.activePlayer.identity
-                              || "Media"
+                        opacity:
+                            root.activePlayer !== null &&
+                            root.activePlayer.canGoNext
+                            ? 1.0
+                            : 0.35
 
-                        color: "#cdd6f4"
-                        font.pixelSize: 13
+                        Text {
+                            anchors.centerIn: parent
+                            text: "▶"
+                            color: "#cdd6f4"
+                            font.pixelSize: 11
+                        }
+
+                        MouseArea {
+                            anchors.fill: parent
+
+                            cursorShape:
+                                root.activePlayer !== null &&
+                                root.activePlayer.canGoNext
+                                ? Qt.PointingHandCursor
+                                : Qt.ArrowCursor
+
+                            onClicked: {
+                                if (
+                                    root.activePlayer !== null &&
+                                    root.activePlayer.canGoNext
+                                ) {
+                                    root.activePlayer.next()
+                                }
+                            }
+                        }
                     }
-                }
 
-                MouseArea {
-                    anchors.fill: parent
-                    cursorShape: Qt.PointingHandCursor
+                    // Track title - click opens popup
+                    Item {
+                        width: 130
+                        height: 30
 
-                    onClicked: {
-                        if (
-                            root.activePlayer !== null ||
-                            root.lastMediaTitle !== ""
-                        ) {
-                            mediaPopup.visible = !mediaPopup.visible
+                        Text {
+                            anchors {
+                                left: parent.left
+                                right: parent.right
+                                verticalCenter: parent.verticalCenter
+                            }
+
+                            elide: Text.ElideRight
+
+                            text:
+                                root.activePlayer !== null
+                                ? (
+                                    root.activePlayer.trackTitle
+                                    || root.activePlayer.identity
+                                    || "Media"
+                                  )
+                                : (
+                                    root.lastMediaTitle !== ""
+                                    ? root.lastMediaTitle
+                                    : "No media"
+                                  )
+
+                            color: "#cdd6f4"
+                            font.pixelSize: 13
+                        }
+
+                        MouseArea {
+                            anchors.fill: parent
+                            cursorShape: Qt.PointingHandCursor
+
+                            onClicked: {
+                                if (
+                                    root.activePlayer === null &&
+                                    root.lastMediaTitle === ""
+                                ) {
+                                    return
+                                }
+
+                                const opening = !mediaPopup.visible
+
+                                if (
+                                    opening &&
+                                    root.activePlayer !== null &&
+                                    root.activePlayer.positionSupported
+                                ) {
+                                    root.activePlayer.positionChanged()
+                                }
+
+                                mediaPopup.visible = opening
+                            }
                         }
                     }
                 }
@@ -724,7 +1745,7 @@ PanelWindow {
         color: "transparent"
 
         implicitWidth: 360
-        implicitHeight: 250
+        implicitHeight: 340
 
         anchor {
             item: mediaButton
@@ -1095,6 +2116,124 @@ PanelWindow {
                     }
                 }
 
+                // Media source / player selector
+                Row {
+                    anchors.horizontalCenter:
+                        parent.horizontalCenter
+
+                    spacing: 8
+
+                    Rectangle {
+                        width: 185
+                        height: 28
+                        radius: 9
+                        color: "#313244"
+
+                        Text {
+                            anchors {
+                                left: parent.left
+                                right: parent.right
+                                verticalCenter:
+                                    parent.verticalCenter
+                                leftMargin: 10
+                                rightMargin: 10
+                            }
+
+                            elide: Text.ElideRight
+
+                            text:
+                                "Source: " +
+                                root.mediaSourceLabel()
+
+                            color: "#cdd6f4"
+                            font.pixelSize: 11
+                        }
+
+                        MouseArea {
+                            anchors.fill: parent
+
+                            cursorShape:
+                                root.logicalMediaSources().length > 1
+                                ? Qt.PointingHandCursor
+                                : Qt.ArrowCursor
+
+                            onClicked: {
+                                if (
+                                    root.logicalMediaSources().length > 1
+                                ) {
+                                    root.cycleMediaPlayer()
+                                }
+                            }
+                        }
+                    }
+
+                    Rectangle {
+                        width: 60
+                        height: 28
+                        radius: 9
+                        color: "#313244"
+
+                        visible:
+                            root.lastLocalUri !== "" &&
+                            (
+                                root.activePlayer === null ||
+                                !root.playerIsLocal(
+                                    root.activePlayer
+                                )
+                            )
+
+                        Text {
+                            anchors.centerIn: parent
+                            text: "Local"
+                            color: "#cdd6f4"
+                            font.pixelSize: 11
+                        }
+
+                        MouseArea {
+                            anchors.fill: parent
+                            cursorShape:
+                                Qt.PointingHandCursor
+
+                            onClicked: {
+                                root.resumeLocalSession()
+                            }
+                        }
+                    }
+                }
+
+                // Local playback mode
+                Rectangle {
+                    width: 44
+                    height: 30
+                    radius: 9
+                    anchors.horizontalCenter: parent.horizontalCenter
+                    color: "#313244"
+
+                    visible:
+                        root.activePlayer !== null
+                        ? (
+                            root.activePlayer.loopSupported ||
+                            root.activePlayer.shuffleSupported
+                          )
+                        : root.lastLocalUri !== ""
+
+                    Text {
+                        anchors.centerIn: parent
+                        text: root.playbackModeIcon()
+                        color: "#cdd6f4"
+                        font.pixelSize: 12
+                    }
+
+                    MouseArea {
+                        anchors.fill: parent
+                        cursorShape: Qt.PointingHandCursor
+
+                        onClicked: {
+                            root.nextPlaybackMode()
+                        }
+                    }
+                }
+
                 // System volume
                 Row {
                     anchors.horizontalCenter: parent.horizontalCenter
@@ -1190,17 +2329,17 @@ PanelWindow {
             }
         }
 
-        Timer {
-            interval: 1000
-            repeat: true
-
+        FrameAnimation {
             running:
                 mediaPopup.visible &&
                 root.activePlayer !== null &&
                 root.activePlayer.isPlaying
 
             onTriggered: {
-                if (root.activePlayer !== null) {
+                if (
+                    root.activePlayer !== null &&
+                    root.activePlayer.positionSupported
+                ) {
                     root.activePlayer.positionChanged()
                 }
             }

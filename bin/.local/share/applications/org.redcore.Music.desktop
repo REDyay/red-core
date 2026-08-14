@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Red Core Music
+Comment=Open local music with Red Core
+Exec=redcore-local-media %f
+Icon=audio-x-generic
+Terminal=false
+NoDisplay=true
+MimeType=audio/mpeg;audio/flac;audio/ogg;audio/x-vorbis+ogg;audio/opus;audio/mp4;audio/aac;audio/x-wav;audio/x-ms-wma;
+Categories=AudioVideo;Audio;Player;

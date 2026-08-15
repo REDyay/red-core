@@ -1,0 +1,1431 @@
+#!/usr/bin/env python3
+
+import glob
+import json
+import os
+import select
+import shutil
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+
+
+INTERVAL = 1.0
+ONCE = "--once" in sys.argv
+
+
+# ============================================================
+# GENERIC HELPERS
+# ============================================================
+
+def read_text(path, default=""):
+    try:
+        return Path(path).read_text().strip()
+    except Exception:
+        return default
+
+
+def read_int(path, default=None):
+    try:
+        return int(read_text(path))
+    except Exception:
+        return default
+
+
+def clamp(value, minimum=0, maximum=100):
+    if value is None:
+        return None
+
+    try:
+        return max(
+            minimum,
+            min(maximum, float(value))
+        )
+    except Exception:
+        return None
+
+
+# ============================================================
+# CPU
+# ============================================================
+
+def read_cpu_stat():
+    try:
+        fields = (
+            Path("/proc/stat")
+            .read_text()
+            .splitlines()[0]
+            .split()
+        )
+
+        values = [
+            int(value)
+            for value in fields[1:]
+        ]
+
+        # user nice system idle iowait irq
+        # softirq steal guest guest_nice
+        while len(values) < 8:
+            values.append(0)
+
+        idle = (
+            values[3] +
+            values[4]
+        )
+
+        total = sum(values[:8])
+
+        return total, idle
+
+    except Exception:
+        return None
+
+
+def cpu_usage(previous, current):
+    if (
+        previous is None or
+        current is None
+    ):
+        return 0
+
+    total_delta = (
+        current[0] -
+        previous[0]
+    )
+
+    idle_delta = (
+        current[1] -
+        previous[1]
+    )
+
+    if total_delta <= 0:
+        return 0
+
+    value = (
+        100.0 *
+        (
+            total_delta -
+            idle_delta
+        ) /
+        total_delta
+    )
+
+    return int(
+        round(
+            clamp(value) or 0
+        )
+    )
+
+
+# ============================================================
+# RAM
+# ============================================================
+
+def memory_usage():
+    total = None
+    available = None
+
+    try:
+        with open(
+            "/proc/meminfo",
+            "r",
+            encoding="utf-8"
+        ) as file:
+
+            for line in file:
+                if line.startswith(
+                    "MemTotal:"
+                ):
+                    total = int(
+                        line.split()[1]
+                    )
+
+                elif line.startswith(
+                    "MemAvailable:"
+                ):
+                    available = int(
+                        line.split()[1]
+                    )
+
+                if (
+                    total is not None and
+                    available is not None
+                ):
+                    break
+
+    except Exception:
+        return 0
+
+    if not total:
+        return 0
+
+    return int(
+        round(
+            100 *
+            (total - available) /
+            total
+        )
+    )
+
+
+# ============================================================
+# CPU TEMPERATURE
+# ============================================================
+
+def discover_cpu_temp_sensors():
+    candidates = []
+
+    for hwmon in glob.glob(
+        "/sys/class/hwmon/hwmon*"
+    ):
+        name = read_text(
+            Path(hwmon) / "name"
+        ).lower()
+
+        # We deliberately avoid generic motherboard
+        # temperature sensors such as acpitz.
+        if name not in {
+            "coretemp",
+            "k10temp",
+            "zenpower",
+            "cpu_thermal",
+            "x86_pkg_temp",
+            "soc_thermal",
+        }:
+            continue
+
+        inputs = glob.glob(
+            f"{hwmon}/temp*_input"
+        )
+
+        labelled = []
+
+        for input_path in inputs:
+            stem = Path(
+                input_path
+            ).name.replace(
+                "_input",
+                ""
+            )
+
+            label = read_text(
+                Path(hwmon) /
+                f"{stem}_label"
+            ).lower()
+
+            priority = 50
+
+            if "tdie" in label:
+                priority = 0
+
+            elif "package id" in label:
+                priority = 0
+
+            elif "cpu package" in label:
+                priority = 0
+
+            elif label == "package":
+                priority = 0
+
+            elif label == "cpu":
+                priority = 1
+
+            elif "tctl" in label:
+                priority = 5
+
+            elif "core" in label:
+                priority = 10
+
+            elif name in {
+                "cpu_thermal",
+                "x86_pkg_temp",
+                "soc_thermal",
+            }:
+                priority = 1
+
+            labelled.append(
+                (
+                    priority,
+                    input_path
+                )
+            )
+
+        if labelled:
+            labelled.sort(
+                key=lambda item:
+                    item[0]
+            )
+
+            best_priority = (
+                labelled[0][0]
+            )
+
+            best = [
+                path
+                for priority, path
+                in labelled
+                if priority ==
+                    best_priority
+            ]
+
+            candidates.extend(best)
+
+    # Some platforms expose CPU temperature as thermal zones.
+    if not candidates:
+        accepted = {
+            "x86_pkg_temp",
+            "cpu-thermal",
+            "cpu_thermal",
+            "soc_thermal",
+            "soc-thermal",
+        }
+
+        for zone in glob.glob(
+            "/sys/class/thermal/thermal_zone*"
+        ):
+            zone_type = read_text(
+                Path(zone) / "type"
+            ).lower()
+
+            if zone_type in accepted:
+                temp = (
+                    Path(zone) /
+                    "temp"
+                )
+
+                if temp.is_file():
+                    candidates.append(
+                        str(temp)
+                    )
+
+    return list(
+        dict.fromkeys(
+            candidates
+        )
+    )
+
+
+CPU_TEMP_SENSORS = (
+    discover_cpu_temp_sensors()
+)
+
+
+def cpu_temperature():
+    values = []
+
+    for path in CPU_TEMP_SENSORS:
+        value = read_int(path)
+
+        if value is None:
+            continue
+
+        # Linux hwmon temperature values
+        # normally use millidegrees Celsius.
+        if abs(value) > 1000:
+            value = (
+                value /
+                1000.0
+            )
+
+        # Filter obviously invalid readings.
+        if -20 <= value <= 150:
+            values.append(value)
+
+    if not values:
+        return None
+
+    return int(
+        round(
+            max(values)
+        )
+    )
+
+
+# ============================================================
+# NETWORK
+# ============================================================
+
+def default_ipv4_interface():
+    best = None
+
+    try:
+        lines = (
+            Path("/proc/net/route")
+            .read_text()
+            .splitlines()[1:]
+        )
+
+        for line in lines:
+            fields = line.split()
+
+            if len(fields) < 8:
+                continue
+
+            interface = fields[0]
+            destination = fields[1]
+
+            if destination != "00000000":
+                continue
+
+            try:
+                flags = int(
+                    fields[3],
+                    16
+                )
+
+                metric = int(
+                    fields[6]
+                )
+            except Exception:
+                continue
+
+            # Route is UP.
+            if not flags & 0x1:
+                continue
+
+            if (
+                best is None or
+                metric < best[0]
+            ):
+                best = (
+                    metric,
+                    interface
+                )
+
+    except Exception:
+        pass
+
+    return (
+        best[1]
+        if best is not None
+        else None
+    )
+
+
+def fallback_interface():
+    candidates = []
+
+    for path in glob.glob(
+        "/sys/class/net/*"
+    ):
+        interface = Path(path).name
+
+        if interface == "lo":
+            continue
+
+        state = read_text(
+            Path(path) /
+            "operstate"
+        )
+
+        carrier = read_int(
+            Path(path) /
+            "carrier",
+            0
+        )
+
+        if (
+            state == "up" or
+            carrier == 1
+        ):
+            candidates.append(
+                interface
+            )
+
+    if not candidates:
+        return None
+
+    # Prefer wireless/physical interfaces
+    # over obvious virtual interfaces.
+    def rank(interface):
+        base = (
+            Path("/sys/class/net") /
+            interface
+        )
+
+        if (
+            base /
+            "wireless"
+        ).exists():
+            return 0
+
+        if (
+            base /
+            "device"
+        ).exists():
+            return 1
+
+        return 2
+
+    candidates.sort(
+        key=rank
+    )
+
+    return candidates[0]
+
+
+def active_interface():
+    return (
+        default_ipv4_interface()
+        or fallback_interface()
+    )
+
+
+def network_type(interface):
+    if not interface:
+        return "none"
+
+    base = (
+        Path("/sys/class/net") /
+        interface
+    )
+
+    if (
+        base /
+        "wireless"
+    ).exists():
+        return "wifi"
+
+    return "ethernet"
+
+
+class NetworkMonitor:
+    def __init__(self):
+        self.interface = None
+        self.rx = None
+        self.tx = None
+        self.time = None
+
+    def sample(self):
+        interface = active_interface()
+
+        if not interface:
+            self.interface = None
+            self.rx = None
+            self.tx = None
+            self.time = None
+
+            return {
+                "interface": "",
+                "type": "none",
+                "download": 0,
+                "upload": 0,
+            }
+
+        stats = (
+            Path("/sys/class/net") /
+            interface /
+            "statistics"
+        )
+
+        rx = read_int(
+            stats / "rx_bytes"
+        )
+
+        tx = read_int(
+            stats / "tx_bytes"
+        )
+
+        now = time.monotonic()
+
+        download = 0
+        upload = 0
+
+        if (
+            interface ==
+                self.interface and
+            rx is not None and
+            tx is not None and
+            self.rx is not None and
+            self.tx is not None and
+            self.time is not None
+        ):
+            elapsed = (
+                now -
+                self.time
+            )
+
+            if elapsed > 0:
+                download = max(
+                    0,
+                    int(
+                        (
+                            rx -
+                            self.rx
+                        ) /
+                        elapsed
+                    )
+                )
+
+                upload = max(
+                    0,
+                    int(
+                        (
+                            tx -
+                            self.tx
+                        ) /
+                        elapsed
+                    )
+                )
+
+        self.interface = interface
+        self.rx = rx
+        self.tx = tx
+        self.time = now
+
+        return {
+            "interface":
+                interface,
+
+            "type":
+                network_type(
+                    interface
+                ),
+
+            "download":
+                download,
+
+            "upload":
+                upload,
+        }
+
+
+# ============================================================
+# GPU DETECTION
+# ============================================================
+
+VENDOR_NAMES = {
+    "0x8086": "intel",
+    "0x1002": "amd",
+    "0x10de": "nvidia",
+}
+
+
+def discover_drm_gpus():
+    result = []
+
+    for card in sorted(
+        glob.glob(
+            "/sys/class/drm/card[0-9]*"
+        )
+    ):
+        device = (
+            Path(card) /
+            "device"
+        )
+
+        vendor_id = read_text(
+            device / "vendor"
+        ).lower()
+
+        vendor = VENDOR_NAMES.get(
+            vendor_id
+        )
+
+        if not vendor:
+            continue
+
+        result.append({
+            "card": Path(card).name,
+            "vendor": vendor,
+            "device": str(device),
+        })
+
+    return result
+
+
+GPU_DEVICES = discover_drm_gpus()
+
+
+def gpu_friendly_name():
+    # lspci is used ONCE at monitor startup only.
+    # It is never executed in the sampling loop.
+    if shutil.which("lspci"):
+        try:
+            output = subprocess.run(
+                ["lspci"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=2,
+                check=False,
+            ).stdout
+
+            names = []
+
+            for line in output.splitlines():
+                if (
+                    "VGA compatible controller"
+                        in line
+                    or "3D controller"
+                        in line
+                    or "Display controller"
+                        in line
+                ):
+                    if ": " in line:
+                        names.append(
+                            line.split(
+                                ": ",
+                                1
+                            )[1]
+                        )
+
+            if names:
+                return " | ".join(
+                    names
+                )
+
+        except Exception:
+            pass
+
+    vendors = []
+
+    for gpu in GPU_DEVICES:
+        value = (
+            gpu["vendor"]
+            .capitalize()
+        )
+
+        if value not in vendors:
+            vendors.append(value)
+
+    if vendors:
+        return " + ".join(
+            vendors
+        ) + " GPU"
+
+    return "Unknown"
+
+
+GPU_NAME = gpu_friendly_name()
+
+
+# ============================================================
+# AMD GPU
+# ============================================================
+
+class AmdGpuMonitor:
+    def __init__(self, gpu):
+        self.gpu = gpu
+
+        self.busy = (
+            Path(
+                gpu["device"]
+            ) /
+            "gpu_busy_percent"
+        )
+
+    def value(self):
+        value = read_int(
+            self.busy
+        )
+
+        return clamp(value)
+
+
+# ============================================================
+# INTEL GPU
+# One persistent intel_gpu_top process.
+# ============================================================
+
+class IntelGpuMonitor:
+    def __init__(self):
+        self.latest = None
+        self.process = None
+
+        executable = shutil.which(
+            "intel_gpu_top"
+        )
+
+        if not executable:
+            return
+
+        try:
+            self.process = (
+                subprocess.Popen(
+                    [
+                        executable,
+                        "-J",
+                        "-s",
+                        "1000",
+                    ],
+                    stdout=
+                        subprocess.PIPE,
+                    stderr=
+                        subprocess.DEVNULL,
+                    text=True,
+                    bufsize=1,
+                )
+            )
+
+            threading.Thread(
+                target=self._reader,
+                daemon=True,
+            ).start()
+
+        except Exception:
+            self.process = None
+
+    def _store_json(self, data):
+        values = []
+
+        def walk(value):
+            if isinstance(
+                value,
+                dict
+            ):
+                busy = value.get(
+                    "busy"
+                )
+
+                if isinstance(
+                    busy,
+                    (int, float)
+                ):
+                    values.append(
+                        float(busy)
+                    )
+
+                for child in (
+                    value.values()
+                ):
+                    walk(child)
+
+            elif isinstance(
+                value,
+                list
+            ):
+                for child in value:
+                    walk(child)
+
+        # Prefer engine utilization.
+        engines = (
+            data.get("engines")
+            if isinstance(
+                data,
+                dict
+            )
+            else None
+        )
+
+        if engines is not None:
+            walk(engines)
+        else:
+            walk(data)
+
+        if values:
+            self.latest = clamp(
+                max(values)
+            )
+
+    def _reader(self):
+        if (
+            self.process is None or
+            self.process.stdout
+                is None
+        ):
+            return
+
+        buffer = []
+        depth = 0
+        in_string = False
+        escaped = False
+
+        try:
+            while True:
+                char = (
+                    self.process
+                    .stdout
+                    .read(1)
+                )
+
+                if not char:
+                    break
+
+                if depth == 0:
+                    if char == "{":
+                        buffer = ["{"]
+                        depth = 1
+                        in_string = False
+                        escaped = False
+
+                    continue
+
+                buffer.append(char)
+
+                if in_string:
+                    if escaped:
+                        escaped = False
+
+                    elif char == "\\":
+                        escaped = True
+
+                    elif char == '"':
+                        in_string = False
+
+                    continue
+
+                if char == '"':
+                    in_string = True
+
+                elif char == "{":
+                    depth += 1
+
+                elif char == "}":
+                    depth -= 1
+
+                    if depth == 0:
+                        try:
+                            data = (
+                                json.loads(
+                                    "".join(
+                                        buffer
+                                    )
+                                )
+                            )
+
+                            self._store_json(
+                                data
+                            )
+
+                        except Exception:
+                            pass
+
+                        buffer = []
+
+        except Exception:
+            pass
+
+    def value(self):
+        if (
+            self.process is not None and
+            self.process.poll()
+                is not None
+        ):
+            self.latest = None
+
+        return self.latest
+
+
+# ============================================================
+# NVIDIA GPU
+# One persistent nvidia-smi process per NVIDIA GPU.
+# ============================================================
+
+class NvidiaGpuMonitor:
+    def __init__(self, index):
+        self.index = index
+        self.latest = None
+        self.process = None
+
+        executable = shutil.which(
+            "nvidia-smi"
+        )
+
+        if not executable:
+            return
+
+        try:
+            self.process = (
+                subprocess.Popen(
+                    [
+                        executable,
+                        "-i",
+                        str(index),
+                        "--query-gpu="
+                        "utilization.gpu",
+                        "--format="
+                        "csv,noheader,nounits",
+                        "-l",
+                        "1",
+                    ],
+                    stdout=
+                        subprocess.PIPE,
+                    stderr=
+                        subprocess.DEVNULL,
+                    text=True,
+                    bufsize=1,
+                )
+            )
+
+            threading.Thread(
+                target=self._reader,
+                daemon=True,
+            ).start()
+
+        except Exception:
+            self.process = None
+
+    def _reader(self):
+        if (
+            self.process is None or
+            self.process.stdout
+                is None
+        ):
+            return
+
+        try:
+            for line in (
+                self.process.stdout
+            ):
+                try:
+                    self.latest = clamp(
+                        float(
+                            line.strip()
+                        )
+                    )
+
+                except Exception:
+                    pass
+
+        except Exception:
+            pass
+
+    def value(self):
+        if (
+            self.process is not None and
+            self.process.poll()
+                is not None
+        ):
+            self.latest = None
+
+        return self.latest
+
+
+def nvidia_indices():
+    executable = shutil.which(
+        "nvidia-smi"
+    )
+
+    if not executable:
+        return []
+
+    try:
+        output = subprocess.run(
+            [
+                executable,
+                "--query-gpu=index",
+                "--format="
+                "csv,noheader,nounits",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=2,
+            check=False,
+        ).stdout
+
+        result = []
+
+        for line in output.splitlines():
+            try:
+                result.append(
+                    int(
+                        line.strip()
+                    )
+                )
+            except Exception:
+                pass
+
+        return result
+
+    except Exception:
+        return []
+
+
+# ============================================================
+# GPU MANAGER
+# ============================================================
+
+GPU_MONITORS = []
+
+
+def stop_gpu_monitor(monitor):
+    process = getattr(
+        monitor,
+        "process",
+        None
+    )
+
+    if (
+        process is None or
+        process.poll() is not None
+    ):
+        return
+
+    try:
+        process.terminate()
+
+        try:
+            process.wait(
+                timeout=0.5
+            )
+        except subprocess.TimeoutExpired:
+            process.kill()
+
+    except Exception:
+        pass
+
+
+def rebuild_gpu_monitors():
+    global GPU_DEVICES
+    global GPU_NAME
+    global GPU_MONITORS
+
+    # Stop old vendor monitoring processes first.
+    old_monitors = GPU_MONITORS
+    GPU_MONITORS = []
+
+    for _, monitor in old_monitors:
+        stop_gpu_monitor(
+            monitor
+        )
+
+    # Rediscover actual DRM hardware.
+    GPU_DEVICES = (
+        discover_drm_gpus()
+    )
+
+    GPU_NAME = (
+        gpu_friendly_name()
+    )
+
+    monitors = []
+
+    # AMD: kernel sysfs backend.
+    for gpu in GPU_DEVICES:
+        if gpu["vendor"] == "amd":
+            monitors.append(
+                (
+                    "amd",
+                    AmdGpuMonitor(gpu)
+                )
+            )
+
+    # Intel: one persistent intel_gpu_top.
+    if any(
+        gpu["vendor"] == "intel"
+        for gpu in GPU_DEVICES
+    ):
+        monitors.append(
+            (
+                "intel",
+                IntelGpuMonitor()
+            )
+        )
+
+    # NVIDIA: one persistent monitor per GPU.
+    for index in nvidia_indices():
+        monitors.append(
+            (
+                "nvidia",
+                NvidiaGpuMonitor(index)
+            )
+        )
+
+    GPU_MONITORS = monitors
+
+
+rebuild_gpu_monitors()
+
+
+def gpu_sample():
+    values = []
+
+    for vendor, monitor in (
+        list(GPU_MONITORS)
+    ):
+        try:
+            value = monitor.value()
+        except Exception:
+            value = None
+
+        if value is not None:
+            values.append(
+                (
+                    float(value),
+                    vendor
+                )
+            )
+
+    if not values:
+        vendor = (
+            GPU_DEVICES[0]["vendor"]
+            if GPU_DEVICES
+            else "unknown"
+        )
+
+        return (
+            vendor,
+            None
+        )
+
+    # Hybrid systems:
+    # display the GPU doing the most work.
+    values.sort(
+        key=lambda item:
+            item[0],
+        reverse=True
+    )
+
+    value, vendor = values[0]
+
+    return (
+        vendor,
+        int(round(value))
+    )
+
+
+# ============================================================
+# HARDWARE HOT-PLUG
+# Event-driven: no hardware polling loop.
+# ============================================================
+
+UDEV_PROCESS = None
+
+hardware_refresh_pending = False
+hardware_refresh_deadline = 0.0
+
+
+def start_udev_monitor():
+    global UDEV_PROCESS
+
+    if ONCE:
+        return
+
+    executable = shutil.which(
+        "udevadm"
+    )
+
+    if not executable:
+        return
+
+    if (
+        UDEV_PROCESS is not None and
+        UDEV_PROCESS.poll() is None
+    ):
+        return
+
+    try:
+        UDEV_PROCESS = subprocess.Popen(
+            [
+                executable,
+                "monitor",
+                "--udev",
+
+                "--subsystem-match=drm",
+                "--subsystem-match=net",
+                "--subsystem-match=hwmon",
+                "--subsystem-match=thermal",
+                "--subsystem-match=power_supply",
+                "--subsystem-match=backlight",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            bufsize=1,
+        )
+
+    except Exception:
+        UDEV_PROCESS = None
+
+
+def schedule_hardware_refresh():
+    global hardware_refresh_pending
+    global hardware_refresh_deadline
+
+    hardware_refresh_pending = True
+
+    # Many devices generate several udev events.
+    # Collapse the burst into one rediscovery.
+    hardware_refresh_deadline = (
+        time.monotonic() + 0.35
+    )
+
+
+def refresh_hardware_if_needed():
+    global hardware_refresh_pending
+    global CPU_TEMP_SENSORS
+
+    if not hardware_refresh_pending:
+        return
+
+    if (
+        time.monotonic() <
+        hardware_refresh_deadline
+    ):
+        return
+
+    hardware_refresh_pending = False
+
+    # hwmon paths can change after device events,
+    # suspend/resume or hardware hot-plug.
+    CPU_TEMP_SENSORS = (
+        discover_cpu_temp_sensors()
+    )
+
+    # GPU topology can also change dynamically.
+    rebuild_gpu_monitors()
+
+
+def wait_for_next_sample(seconds):
+    """
+    Wait for the next metrics sample while simultaneously
+    listening for real hardware events.
+
+    No repeated hardware scan and no udev polling.
+    """
+
+    if seconds <= 0:
+        return
+
+    start_udev_monitor()
+
+    process = UDEV_PROCESS
+
+    if (
+        process is None or
+        process.stdout is None
+    ):
+        time.sleep(seconds)
+        return
+
+    deadline = (
+        time.monotonic() +
+        seconds
+    )
+
+    while True:
+        remaining = (
+            deadline -
+            time.monotonic()
+        )
+
+        if remaining <= 0:
+            return
+
+        # If udevadm died, return to the main loop.
+        # It will be restarted on the next wait.
+        if process.poll() is not None:
+            return
+
+        try:
+            ready, _, _ = select.select(
+                [
+                    process.stdout.fileno()
+                ],
+                [],
+                [],
+                remaining,
+            )
+        except Exception:
+            time.sleep(
+                max(
+                    0,
+                    remaining
+                )
+            )
+            return
+
+        if not ready:
+            return
+
+        line = process.stdout.readline()
+
+        if not line:
+            return
+
+        # Filters already guarantee this is one of
+        # the hardware classes Red Core cares about.
+        schedule_hardware_refresh()
+
+
+# ============================================================
+# MAIN LOOP
+# ============================================================
+
+network = NetworkMonitor()
+previous_cpu = read_cpu_stat()
+
+next_sample = (
+    time.monotonic() +
+    INTERVAL
+)
+
+while True:
+    delay = (
+        next_sample -
+        time.monotonic()
+    )
+
+    if delay > 0:
+        wait_for_next_sample(
+            delay
+        )
+
+    refresh_hardware_if_needed()
+
+    now_cpu = read_cpu_stat()
+
+    cpu = cpu_usage(
+        previous_cpu,
+        now_cpu
+    )
+
+    previous_cpu = now_cpu
+
+    gpu_vendor, gpu_usage = (
+        gpu_sample()
+    )
+
+    data = {
+        "cpu":
+            cpu,
+
+        "cpuTemp":
+            cpu_temperature(),
+
+        "ram":
+            memory_usage(),
+
+        "gpuName":
+            GPU_NAME,
+
+        "gpuVendor":
+            gpu_vendor,
+
+        "gpuUsage":
+            gpu_usage,
+
+        "network":
+            network.sample(),
+    }
+
+    print(
+        json.dumps(
+            data,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ),
+        flush=True,
+    )
+
+    if ONCE:
+        break
+
+    next_sample += INTERVAL
+
+    # If the system slept or was heavily stalled,
+    # resynchronise instead of rapidly catching up.
+    current = time.monotonic()
+
+    if (
+        current -
+        next_sample
+    ) > INTERVAL:
+        next_sample = (
+            current +
+            INTERVAL
+        )

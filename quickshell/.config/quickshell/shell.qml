@@ -12,12 +12,124 @@ PanelWindow {
         top: true
     }
 
-    implicitWidth: 1180
+    // Adaptive bar width.
+    //
+    // The larger side is mirrored mathematically so that
+    // workspaceSection always stays in the TRUE center.
+    //
+    // 14px outer margin + 16px safety gap on each side.
+    implicitWidth:
+        Math.ceil(
+            workspaceSection.implicitWidth +
+            2 * Math.max(
+                leftSection.implicitWidth,
+                rightSection.implicitWidth
+            ) +
+            60
+        )
+
     implicitHeight: 48
     color: "transparent"
 
+    // Normally Red Core must never steal keyboard focus.
+    // Enable it only while an interactive popup needs typing.
+    focusable:
+        networkModule.keyboardInputActive
+
     property var workspaces: []
     property int activeWorkspace: -1
+
+    // Keyboard layout state from Niri.
+    property var keyboardLayouts: []
+    property int keyboardLayoutIndex: 0
+
+    function keyboardLayoutLabel() {
+        if (
+            root.keyboardLayoutIndex < 0 ||
+            root.keyboardLayoutIndex >=
+                root.keyboardLayouts.length
+        ) {
+            return "--"
+        }
+
+        const name =
+            String(
+                root.keyboardLayouts[
+                    root.keyboardLayoutIndex
+                ] || ""
+            ).toLowerCase()
+
+        if (name.indexOf("french") !== -1)
+            return "FR"
+
+        if (name.indexOf("arabic") !== -1)
+            return "AR"
+
+        // Generic fallback for future layouts.
+        return String(
+            root.keyboardLayouts[
+                root.keyboardLayoutIndex
+            ] || "--"
+        )
+        .slice(0, 2)
+        .toUpperCase()
+    }
+
+    // Number of workspace buttons shown at once.
+    // Later this can become a Control Center setting.
+    property int visibleWorkspaceCount: 5
+
+    function visibleWorkspaces() {
+        const all =
+            root.workspaces || []
+
+        const count =
+            root.visibleWorkspaceCount
+
+        if (all.length <= count)
+            return all
+
+        let activeIndex = -1
+
+        for (
+            let i = 0;
+            i < all.length;
+            i++
+        ) {
+            if (
+                all[i].id ===
+                root.activeWorkspace
+            ) {
+                activeIndex = i
+                break
+            }
+        }
+
+        // Fallback to the beginning if active workspace
+        // has not been resolved yet.
+        if (activeIndex < 0)
+            activeIndex = 0
+
+        const half =
+            Math.floor(count / 2)
+
+        let start =
+            activeIndex - half
+
+        if (start < 0)
+            start = 0
+
+        const maxStart =
+            all.length - count
+
+        if (start > maxStart)
+            start = maxStart
+
+        return all.slice(
+            start,
+            start + count
+        )
+    }
 
     // Niri windows used by the workspace app indicators.
     property var niriWindows: []
@@ -113,6 +225,12 @@ PanelWindow {
                 const resolved =
                     root.appIconCache[detectedId]
 
+                // IMPORTANT:
+                // effectiveWindowAppId() is used inside a QML
+                // binding and MUST stay completely side-effect free.
+                //
+                // The Terminal scanner resolves detected application
+                // icons separately when an event arrives.
                 if (
                     resolved !== undefined &&
                     resolved !== null &&
@@ -120,12 +238,6 @@ PanelWindow {
                 ) {
                     return detectedId
                 }
-
-                // Ask resolver once. Until it finishes,
-                // keep the terminal's own icon.
-                root.requestAppIcon(
-                    detectedId
-                )
             }
         }
 
@@ -137,9 +249,11 @@ PanelWindow {
     }
 
     function appsForWorkspace(workspaceId) {
+        const windows = []
         const apps = []
         const seen = ({})
 
+        // First collect all windows from this workspace.
         for (
             let i = 0;
             i < root.niriWindows.length;
@@ -149,10 +263,76 @@ PanelWindow {
                 root.niriWindows[i]
 
             if (
-                window.workspace_id !== workspaceId
+                window.workspace_id === workspaceId
             ) {
-                continue
+                windows.push(window)
             }
+        }
+
+        // Match Niri's real visual order.
+        //
+        // pos_in_scrolling_layout is typically:
+        // [column, tile]
+        //
+        // Sort by column first, then tile position.
+        windows.sort(
+            function(a, b) {
+                const aPos =
+                    a.layout &&
+                    a.layout.pos_in_scrolling_layout
+                    ? a.layout.pos_in_scrolling_layout
+                    : null
+
+                const bPos =
+                    b.layout &&
+                    b.layout.pos_in_scrolling_layout
+                    ? b.layout.pos_in_scrolling_layout
+                    : null
+
+                const aColumn =
+                    aPos && aPos.length > 0
+                    ? Number(aPos[0])
+                    : Number.MAX_SAFE_INTEGER
+
+                const bColumn =
+                    bPos && bPos.length > 0
+                    ? Number(bPos[0])
+                    : Number.MAX_SAFE_INTEGER
+
+                if (aColumn !== bColumn)
+                    return aColumn - bColumn
+
+                const aTile =
+                    aPos && aPos.length > 1
+                    ? Number(aPos[1])
+                    : Number.MAX_SAFE_INTEGER
+
+                const bTile =
+                    bPos && bPos.length > 1
+                    ? Number(bPos[1])
+                    : Number.MAX_SAFE_INTEGER
+
+                if (aTile !== bTile)
+                    return aTile - bTile
+
+                // Stable deterministic fallback.
+                return Number(a.id || 0) -
+                       Number(b.id || 0)
+            }
+        )
+
+        // Only after sorting do we remove duplicate app ids.
+        //
+        // This means if multiple windows belong to the same app,
+        // the icon represents the first visible occurrence of that
+        // app in Niri's layout.
+        for (
+            let i = 0;
+            i < windows.length;
+            i++
+        ) {
+            const window =
+                windows[i]
 
             const appId =
                 root.effectiveWindowAppId(
@@ -1495,12 +1675,8 @@ PanelWindow {
             }
 
             Component.onDestruction: {
-                Qt.callLater(
-                    function() {
-                        root.chooseMediaPlayer(
-                            null
-                        )
-                    }
+                root.chooseMediaPlayer(
+                    null
                 )
             }
 
@@ -1729,6 +1905,38 @@ PanelWindow {
                             event.WorkspaceActivated.id
                     }
 
+                    // Keyboard layouts full snapshot/config change.
+                    if (event.KeyboardLayoutsChanged) {
+                        const wrapper =
+                            event.KeyboardLayoutsChanged
+
+                        const data =
+                            wrapper.keyboard_layouts || {}
+
+                        root.keyboardLayouts =
+                            data.names || []
+
+                        if (
+                            data.current_idx !== undefined
+                        ) {
+                            root.keyboardLayoutIndex =
+                                data.current_idx
+                        }
+                    }
+
+                    // Active keyboard layout changed.
+                    if (event.KeyboardLayoutSwitched) {
+                        const data =
+                            event.KeyboardLayoutSwitched
+
+                        if (
+                            data.idx !== undefined
+                        ) {
+                            root.keyboardLayoutIndex =
+                                data.idx
+                        }
+                    }
+
                     // Full window snapshot.
                     if (event.WindowsChanged) {
                         root.niriWindows =
@@ -1802,6 +2010,129 @@ PanelWindow {
                         }
                     }
 
+                    // Window positions/layout changed inside Niri.
+                    //
+                    // This is separate from WindowOpenedOrChanged:
+                    // moving columns left/right may only update layout.
+                    if (event.WindowLayoutsChanged) {
+                        const payload =
+                            event.WindowLayoutsChanged
+
+                        const changes =
+                            payload.changes ||
+                            payload.layouts ||
+                            payload.windows ||
+                            payload
+
+                        let list =
+                            root.niriWindows.slice()
+
+                        function applyLayout(
+                            windowId,
+                            layout
+                        ) {
+                            for (
+                                let i = 0;
+                                i < list.length;
+                                i++
+                            ) {
+                                if (
+                                    String(list[i].id) !==
+                                    String(windowId)
+                                ) {
+                                    continue
+                                }
+
+                                const updated =
+                                    Object.assign(
+                                        {},
+                                        list[i]
+                                    )
+
+                                updated.layout =
+                                    layout
+
+                                list[i] =
+                                    updated
+
+                                return
+                            }
+                        }
+
+                        if (
+                            Array.isArray(changes)
+                        ) {
+                            for (
+                                let i = 0;
+                                i < changes.length;
+                                i++
+                            ) {
+                                const item =
+                                    changes[i]
+
+                                if (
+                                    item === null ||
+                                    item === undefined
+                                ) {
+                                    continue
+                                }
+
+                                if (
+                                    item.id !== undefined &&
+                                    item.layout !== undefined
+                                ) {
+                                    applyLayout(
+                                        item.id,
+                                        item.layout
+                                    )
+                                    continue
+                                }
+
+                                if (
+                                    Array.isArray(item) &&
+                                    item.length >= 2
+                                ) {
+                                    applyLayout(
+                                        item[0],
+                                        item[1]
+                                    )
+                                }
+                            }
+
+                        } else if (
+                            changes !== null &&
+                            typeof changes === "object"
+                        ) {
+                            for (
+                                const id in changes
+                            ) {
+                                const value =
+                                    changes[id]
+
+                                if (
+                                    value &&
+                                    value.layout !== undefined
+                                ) {
+                                    applyLayout(
+                                        id,
+                                        value.layout
+                                    )
+                                } else {
+                                    applyLayout(
+                                        id,
+                                        value
+                                    )
+                                }
+                            }
+                        }
+
+                        // Important:
+                        // assign a NEW array so QML bindings such as
+                        // workspaceApps are reevaluated immediately.
+                        root.niriWindows =
+                            list
+                    }
+
                     // Closed window.
                     if (event.WindowClosed) {
                         const id =
@@ -1858,26 +2189,46 @@ PanelWindow {
         id: workspaceSwitch
     }
 
+    Process {
+        id: keyboardLayoutSwitch
+    }
+
     // =========================
     // SYSTEM INFO
     // =========================
 
+    // One persistent monitor process.
+    // Hardware detection happens once in the backend,
+    // then real measurements are streamed every second.
     Process {
         id: systemInfoProcess
 
-        command: ["redcore-system-info"]
+        running: true
 
-        stdout: StdioCollector {
-            onStreamFinished: {
+        command: [
+            "redcore-system-monitor"
+        ]
+
+        stdout: SplitParser {
+            onRead: line => {
                 try {
-                    const data = JSON.parse(text)
+                    const data =
+                        JSON.parse(line)
 
-                    root.cpuUsage = data.cpu
-                    root.cpuTemp = data.cpuTemp
-                    root.ramUsage = data.ram
+                    root.cpuUsage =
+                        data.cpu
 
-                    root.gpuUsage = data.gpuUsage
-                    root.gpuVendor = data.gpuVendor
+                    root.cpuTemp =
+                        data.cpuTemp
+
+                    root.ramUsage =
+                        data.ram
+
+                    root.gpuUsage =
+                        data.gpuUsage
+
+                    root.gpuVendor =
+                        data.gpuVendor
 
                     root.networkInterface =
                         data.network.interface
@@ -1893,23 +2244,32 @@ PanelWindow {
 
                 } catch (error) {
                     console.log(
-                        "System info parse error:",
+                        "System monitor parse error:",
                         error
                     )
                 }
             }
         }
+
+        // If the backend crashes unexpectedly,
+        // retry once after a short delay.
+        onRunningChanged: {
+            if (!running) {
+                systemMonitorRestart.restart()
+            }
+        }
     }
 
     Timer {
+        id: systemMonitorRestart
+
         interval: 2000
-        running: true
-        repeat: true
-        triggeredOnStart: true
+        repeat: false
 
         onTriggered: {
             if (!systemInfoProcess.running) {
-                systemInfoProcess.running = true
+                systemInfoProcess.running =
+                    true
             }
         }
     }
@@ -1923,6 +2283,17 @@ PanelWindow {
     }
 
     property var audioSink: Pipewire.defaultAudioSink
+
+    // NetworkManager state.
+
+    // Nearby Wi-Fi networks.
+    // Updated only when requested, never continuously.
+
+    // Wi-Fi connection UI.
+
+
+
+
 
     function changeVolume(delta) {
         if (
@@ -1973,6 +2344,8 @@ PanelWindow {
         // =====================
 
         Row {
+            id: leftSection
+
             anchors {
                 left: parent.left
                 leftMargin: 14
@@ -2006,7 +2379,11 @@ PanelWindow {
             }
 
             // System monitor
+            //
+            // Reserve a stable area for changing numeric values.
+            // CPU/GPU/network updates must never resize the whole bar.
             Row {
+                width: 330
                 anchors.verticalCenter: parent.verticalCenter
                 spacing: 8
 
@@ -2301,11 +2678,14 @@ PanelWindow {
         // =====================
 
         Row {
+            id: workspaceSection
+
             anchors.centerIn: parent
             spacing: 10
 
             Repeater {
-                model: root.workspaces
+                model:
+                    root.visibleWorkspaces()
 
                 Rectangle {
                     id: workspaceItem
@@ -2501,26 +2881,37 @@ PanelWindow {
         // =====================
 
         Row {
+            id: rightSection
+
             anchors {
                 right: parent.right
                 rightMargin: 14
                 verticalCenter: parent.verticalCenter
             }
 
-            spacing: 14
+            spacing: 10
 
-            Text {
-                text:
-                    root.networkType === "ethernet"
-                    ? "Ethernet"
-                    : root.networkType === "wifi"
-                    ? "WiFi"
-                    : "Offline"
+            // ---------------------
+            // Alerts
+            // ---------------------
+            Rectangle {
+                width: 32
+                height: 32
+                radius: 10
+                color: "#313244"
 
-                color: "#cdd6f4"
-                font.pixelSize: 13
+                Text {
+                    anchors.centerIn: parent
+                    text: "!"
+                    color: "#cdd6f4"
+                    font.pixelSize: 13
+                    font.bold: true
+                }
             }
 
+            // ---------------------
+            // Audio
+            // ---------------------
             Rectangle {
                 width: 64
                 height: 32
@@ -2562,45 +2953,161 @@ PanelWindow {
                 }
             }
 
+            // ---------------------
+            // Keyboard layout
+            // ---------------------
             Rectangle {
-                width: 1
-                height: 22
-                color: "#45475a"
-                anchors.verticalCenter:
-                    parent.verticalCenter
+                width: 38
+                height: 32
+                radius: 10
+                color: "#313244"
+
+                Text {
+                    anchors.centerIn: parent
+
+                    text:
+                        root.keyboardLayoutLabel()
+
+                    color: "#cdd6f4"
+                    font.pixelSize: 12
+                    font.bold: true
+                }
+
+                MouseArea {
+                    anchors.fill: parent
+                    cursorShape: Qt.PointingHandCursor
+
+                    onClicked: {
+                        if (
+                            !keyboardLayoutSwitch.running
+                        ) {
+                            keyboardLayoutSwitch.command = [
+                                "niri",
+                                "msg",
+                                "action",
+                                "switch-layout",
+                                "next"
+                            ]
+
+                            keyboardLayoutSwitch.running =
+                                true
+                        }
+                    }
+                }
             }
 
-            Text {
-                text:
-                    Qt.formatDateTime(
-                        clock.date,
-                        "dd/MM"
-                    )
-
-                color: "#cdd6f4"
-                font.pixelSize: 13
+            // ---------------------
+            // Network
+            // ---------------------
+            NetworkModule {
+                id: networkModule
             }
 
-            Text {
-                text:
-                    Qt.formatDateTime(
-                        clock.date,
-                        "HH:mm"
-                    )
-
-                color: "#cdd6f4"
-                font.pixelSize: 13
-            }
-
+            // ---------------------
+            // Bluetooth
+            // Placeholder
+            // ---------------------
             Rectangle {
-                width: 1
-                height: 22
-                color: "#45475a"
-                anchors.verticalCenter:
-                    parent.verticalCenter
+                width: 32
+                height: 32
+                radius: 10
+                color: "#313244"
+
+                Text {
+                    anchors.centerIn: parent
+                    text: "BT"
+                    color: "#cdd6f4"
+                    font.pixelSize: 11
+                    font.bold: true
+                }
             }
 
-            // Power button
+            // ---------------------
+            // Battery
+            // Placeholder
+            // ---------------------
+            Rectangle {
+                width: 42
+                height: 32
+                radius: 10
+                color: "#313244"
+
+                Text {
+                    anchors.centerIn: parent
+                    text: "BAT"
+                    color: "#cdd6f4"
+                    font.pixelSize: 10
+                    font.bold: true
+                }
+            }
+
+            // ---------------------
+            // Brightness
+            // Placeholder
+            // ---------------------
+            Rectangle {
+                width: 32
+                height: 32
+                radius: 10
+                color: "#313244"
+
+                Text {
+                    anchors.centerIn: parent
+                    text: "☀"
+                    color: "#cdd6f4"
+                    font.pixelSize: 14
+                }
+            }
+
+            // ---------------------
+            // Weather + Date/Time
+            // ---------------------
+            Rectangle {
+                height: 32
+                width: weatherTimeRow.implicitWidth + 20
+                radius: 10
+                color: "#313244"
+
+                Row {
+                    id: weatherTimeRow
+
+                    anchors.centerIn: parent
+                    spacing: 8
+
+                    // Weather placeholder
+                    Text {
+                        text: "--°"
+                        color: "#cdd6f4"
+                        font.pixelSize: 12
+                    }
+
+                    Text {
+                        text:
+                            Qt.formatDateTime(
+                                clock.date,
+                                "dd/MM"
+                            )
+
+                        color: "#cdd6f4"
+                        font.pixelSize: 12
+                    }
+
+                    Text {
+                        text:
+                            Qt.formatDateTime(
+                                clock.date,
+                                "HH:mm"
+                            )
+
+                        color: "#cdd6f4"
+                        font.pixelSize: 12
+                    }
+                }
+            }
+
+            // ---------------------
+            // Power
+            // ---------------------
             Rectangle {
                 width: 32
                 height: 32

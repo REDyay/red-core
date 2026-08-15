@@ -101,7 +101,31 @@ PanelWindow {
                 detected !== null &&
                 String(detected) !== ""
             ) {
-                return String(detected)
+                const detectedId =
+                    String(detected)
+
+                // A CLI process must have a REAL resolved icon
+                // before it may replace the terminal icon.
+                //
+                // This prevents pacman/makepkg/yay/build tools
+                // and other commands from displaying unrelated
+                // application icons.
+                const resolved =
+                    root.appIconCache[detectedId]
+
+                if (
+                    resolved !== undefined &&
+                    resolved !== null &&
+                    String(resolved) !== ""
+                ) {
+                    return detectedId
+                }
+
+                // Ask resolver once. Until it finishes,
+                // keep the terminal's own icon.
+                root.requestAppIcon(
+                    detectedId
+                )
             }
         }
 
@@ -380,8 +404,98 @@ PanelWindow {
     property real lastLocalPosition: 0
     property string localPlaybackMode: "normal"
 
+    // Compact media state:
+    // playing -> expanded immediately
+    // paused/stopped -> remain expanded for 60 seconds
+    // idle -> music icon only
+    property bool mediaExpanded: false
+
+    // On Red Core startup, Media always begins compact.
+    // It expands only after a real playback event occurs.
+    property bool mediaStartupReady: false
+
+    function updateMediaBarState() {
+        const player = root.activePlayer
+
+        // Startup state is always compact.
+        // The first actual playback change enables normal behavior.
+        if (!root.mediaStartupReady) {
+            root.mediaExpanded = false
+            return
+        }
+
+        if (
+            player !== null &&
+            player.isPlaying
+        ) {
+            mediaCollapseTimer.stop()
+            root.mediaExpanded = true
+            return
+        }
+
+        // If the media bar was visible and playback stopped,
+        // keep it available for 60 seconds.
+        if (root.mediaExpanded) {
+            mediaCollapseTimer.restart()
+            return
+        }
+
+        // No active playback on startup.
+        root.mediaExpanded = false
+    }
+
+    Timer {
+        id: mediaCollapseTimer
+
+        interval: 60000
+        repeat: false
+
+        onTriggered: {
+            const player = root.activePlayer
+
+            if (
+                player === null ||
+                !player.isPlaying
+            ) {
+                root.mediaExpanded = false
+            }
+        }
+    }
+
+    // activePlayer itself can change when switching
+    // Local / Brave / Spotify / etc.
+    Connections {
+        target: root
+
+        function onActivePlayerChanged() {
+            Qt.callLater(
+                root.updateMediaBarState
+            )
+        }
+    }
+
+    // Playback state changed on the current player.
+    Connections {
+        target: root.activePlayer
+        ignoreUnknownSignals: true
+
+        function onIsPlayingChanged() {
+            root.mediaStartupReady = true
+            root.updateMediaBarState()
+        }
+
+        function onPlaybackStateChanged() {
+            root.mediaStartupReady = true
+            root.updateMediaBarState()
+        }
+    }
+
     // Empty = automatic player selection.
     property string pinnedPlayerDbusName: ""
+
+    // If a state write is already running, remember that
+    // another save is needed instead of losing the update.
+    property bool localStateSavePending: false
 
     // Used to detect the actual Paused -> Playing transition.
     property var playerPlayingSnapshot: ({})
@@ -954,6 +1068,204 @@ PanelWindow {
         )
     }
 
+    function chooseMediaPlayer(preferredPlayer) {
+        const players = Mpris.players.values
+
+        // ----------------------------------------------------
+        // 1. A player has just started playback.
+        //    It wins immediately and silences the others.
+        // ----------------------------------------------------
+        if (
+            preferredPlayer !== null &&
+            preferredPlayer !== undefined &&
+            preferredPlayer.isPlaying
+        ) {
+            root.pauseOtherPlayers(
+                preferredPlayer.dbusName
+            )
+
+            root.pinnedPlayerDbusName =
+                preferredPlayer.dbusName
+
+            root.rememberPlayer(
+                preferredPlayer
+            )
+
+            return
+        }
+
+        // ----------------------------------------------------
+        // 2. Keep selected player if it is currently playing.
+        // ----------------------------------------------------
+        if (
+            root.pinnedPlayerDbusName !== ""
+        ) {
+            const pinned =
+                root.findPlayer(
+                    root.pinnedPlayerDbusName
+                )
+
+            if (
+                pinned !== null &&
+                pinned.isPlaying
+            ) {
+                root.rememberPlayer(pinned)
+                return
+            }
+        }
+
+        // ----------------------------------------------------
+        // 3. Find any player actually playing.
+        // ----------------------------------------------------
+        for (
+            let i = 0;
+            i < players.length;
+            i++
+        ) {
+            if (players[i].isPlaying) {
+                root.pauseOtherPlayers(
+                    players[i].dbusName
+                )
+
+                root.pinnedPlayerDbusName =
+                    players[i].dbusName
+
+                root.rememberPlayer(
+                    players[i]
+                )
+
+                return
+            }
+        }
+
+        // ----------------------------------------------------
+        // 4. Keep pinned paused/stopped session.
+        // ----------------------------------------------------
+        if (
+            root.pinnedPlayerDbusName !== ""
+        ) {
+            const pinned =
+                root.findPlayer(
+                    root.pinnedPlayerDbusName
+                )
+
+            if (
+                pinned !== null &&
+                root.playerUsable(pinned)
+            ) {
+                root.rememberPlayer(pinned)
+                return
+            }
+
+            root.pinnedPlayerDbusName = ""
+        }
+
+        // ----------------------------------------------------
+        // 5. Keep last-used session if still available.
+        // ----------------------------------------------------
+        const remembered =
+            root.findPlayer(
+                root.lastPlayerDbusName
+            )
+
+        if (
+            remembered !== null &&
+            root.playerUsable(remembered)
+        ) {
+            root.rememberPlayer(
+                remembered
+            )
+            return
+        }
+
+        // ----------------------------------------------------
+        // 6. Any usable paused MPRIS session.
+        // ----------------------------------------------------
+        for (
+            let i = 0;
+            i < players.length;
+            i++
+        ) {
+            if (
+                root.playerUsable(players[i])
+            ) {
+                root.rememberPlayer(
+                    players[i]
+                )
+                return
+            }
+        }
+
+        // ----------------------------------------------------
+        // 7. Nothing live.
+        //    Keep Local metadata as fallback only.
+        // ----------------------------------------------------
+        root.activePlayer = null
+
+        if (root.lastLocalUri !== "") {
+            root.lastMediaUri =
+                root.lastLocalUri
+
+            root.lastMediaTitle =
+                root.lastLocalTitle
+
+            root.lastMediaArtist =
+                root.lastLocalArtist
+
+            root.lastMediaArt =
+                root.lastLocalArt
+        }
+    }
+
+    function handleMediaPlaybackEvent(player) {
+        if (
+            player === null ||
+            player === undefined
+        ) {
+            root.chooseMediaPlayer(null)
+            return
+        }
+
+        // Playing source becomes active immediately.
+        if (player.isPlaying) {
+            root.chooseMediaPlayer(player)
+        } else {
+            // Save Local position immediately on Pause/Stop.
+            if (
+                root.playerIsLocal(player)
+            ) {
+                root.rememberPlayer(player)
+                root.saveLocalMediaState()
+            }
+
+            root.chooseMediaPlayer(null)
+        }
+
+        root.updateMediaBarState()
+    }
+
+    function handleMediaTrackEvent(player) {
+        if (
+            player === null ||
+            player === undefined
+        ) {
+            return
+        }
+
+        root.rememberPlayer(player)
+
+        if (
+            root.playerIsLocal(player)
+        ) {
+            // New track = important persistent state change.
+            root.saveLocalMediaState()
+        }
+
+        if (player.isPlaying) {
+            root.chooseMediaPlayer(player)
+        }
+    }
+
     function saveLocalMediaState() {
         if (
             root.activePlayer !== null &&
@@ -1015,9 +1327,13 @@ PanelWindow {
         }
 
         if (
-            root.lastLocalUri === "" ||
-            localStateSave.running
+            root.lastLocalUri === ""
         ) {
+            return
+        }
+
+        if (localStateSave.running) {
+            root.localStateSavePending = true
             return
         }
 
@@ -1113,339 +1429,116 @@ PanelWindow {
 
     Process {
         id: localStateSave
-    }
 
-    Process {
-        id: localQueueRead
+        onExited: {
+            if (
+                root.localStateSavePending
+            ) {
+                root.localStateSavePending =
+                    false
 
-        stdout: StdioCollector {
-            onStreamFinished: {
-                try {
-                    const data =
-                        JSON.parse(this.text)
-
-                    root.localQueueCount =
-                        Number(
-                            data.count || 0
-                        )
-
-                    root.localQueueCurrent =
-                        data.current || ""
-
-                    root.localQueueNext =
-                        data.next || ""
-
-                } catch (error) {
-                    root.localQueueCount = 0
-                    root.localQueueCurrent = ""
-                    root.localQueueNext = ""
-                }
+                Qt.callLater(
+                    root.saveLocalMediaState
+                )
             }
         }
     }
 
+
+    // Crash/power-loss protection for Local Music.
+    //
+    // This timer is completely stopped unless a LOCAL track
+    // is actually playing. One state checkpoint per minute.
     Timer {
-        interval: 1000
+        id: localMediaCheckpoint
+
+        interval: 60000
+        repeat: true
 
         running:
-            mediaPopup.visible &&
             root.activePlayer !== null &&
             root.playerIsLocal(
                 root.activePlayer
-            )
-
-        repeat: true
-        triggeredOnStart: true
-
-        onTriggered: {
-            if (
-                root.activePlayer === null ||
-                !root.playerIsLocal(
-                    root.activePlayer
-                )
-            ) {
-                root.localQueueCount = 0
-                return
-            }
-
-            if (!localQueueRead.running) {
-                localQueueRead.command = [
-                    "redcore-local-queue",
-                    root.playerUri(
-                        root.activePlayer
-                    )
-                ]
-
-                localQueueRead.running = true
-            }
-        }
-    }
-
-    // Persist Local position without constantly writing to disk.
-    Timer {
-        interval: 5000
-        running: true
-        repeat: true
+            ) &&
+            root.activePlayer.isPlaying
 
         onTriggered: {
             root.saveLocalMediaState()
         }
     }
 
-    Timer {
-        id: mediaPlayerTracker
+    // =========================
+    // EVENT-DRIVEN MPRIS
+    // =========================
 
-        interval: 350
-        running: true
-        repeat: true
-        triggeredOnStart: true
+    Instantiator {
+        id: mediaPlayerObservers
 
-        onTriggered: {
-            const players =
-                Mpris.players.values
+        model: Mpris.players
 
-            const previous =
-                root.playerPlayingSnapshot || ({})
+        delegate: Scope {
+            required property var modelData
 
-            let snapshot = ({})
-            let playing = []
-            let started = []
+            property var player:
+                modelData
 
-            for (
-                let i = 0;
-                i < players.length;
-                i++
-            ) {
-                const player = players[i]
-
-                const name =
-                    player.dbusName || ""
-
-                const nowPlaying =
-                    player.isPlaying
-
-                snapshot[name] =
-                    nowPlaying
-
-                if (nowPlaying) {
-                    playing.push(player)
-
-                    // This source actually changed
-                    // Paused/Stopped -> Playing.
-                    if (previous[name] !== true) {
-                        started.push(player)
+            Component.onCompleted: {
+                Qt.callLater(
+                    function() {
+                        root.chooseMediaPlayer(
+                            player.isPlaying
+                            ? player
+                            : null
+                        )
                     }
-                }
-            }
-
-            root.playerPlayingSnapshot =
-                snapshot
-
-            // ---------------------------------
-            // A source has just started.
-            // The newest started source wins.
-            // ---------------------------------
-            if (started.length > 0) {
-                let chosen =
-                    started[
-                        started.length - 1
-                    ]
-
-                // If multiple appeared in the same
-                // tick, prefer the one different
-                // from the previous active source.
-                if (
-                    started.length > 1 &&
-                    root.activePlayer !== null
-                ) {
-                    for (
-                        let i = started.length - 1;
-                        i >= 0;
-                        i--
-                    ) {
-                        if (
-                            started[i].dbusName !==
-                            root.activePlayer.dbusName
-                        ) {
-                            chosen = started[i]
-                            break
-                        }
-                    }
-                }
-
-                root.pauseOtherPlayers(
-                    chosen.dbusName
                 )
-
-                root.pinnedPlayerDbusName =
-                    chosen.dbusName
-
-                root.rememberPlayer(chosen)
-                return
             }
 
-            // ---------------------------------
-            // Something is already playing.
-            // Keep active/pinned player if possible.
-            // ---------------------------------
-            if (playing.length > 0) {
-                let chosen = null
-
-                if (
-                    root.pinnedPlayerDbusName !== ""
-                ) {
-                    for (
-                        let i = 0;
-                        i < playing.length;
-                        i++
-                    ) {
-                        if (
-                            playing[i].dbusName ===
-                            root.pinnedPlayerDbusName
-                        ) {
-                            chosen = playing[i]
-                            break
-                        }
+            Component.onDestruction: {
+                Qt.callLater(
+                    function() {
+                        root.chooseMediaPlayer(
+                            null
+                        )
                     }
-                }
-
-                if (
-                    chosen === null &&
-                    root.activePlayer !== null
-                ) {
-                    for (
-                        let i = 0;
-                        i < playing.length;
-                        i++
-                    ) {
-                        if (
-                            playing[i].dbusName ===
-                            root.activePlayer.dbusName
-                        ) {
-                            chosen = playing[i]
-                            break
-                        }
-                    }
-                }
-
-                if (chosen === null)
-                    chosen = playing[0]
-
-                if (playing.length > 1) {
-                    root.pauseOtherPlayers(
-                        chosen.dbusName
-                    )
-                }
-
-                root.rememberPlayer(chosen)
-                return
-            }
-
-            // ---------------------------------
-            // Nothing playing: selected session.
-            //
-            // Browsers may briefly expose an empty/stopped
-            // MPRIS state while changing tracks.
-            // Do NOT jump to Local immediately.
-            // ---------------------------------
-            if (
-                root.pinnedPlayerDbusName !== ""
-            ) {
-                const pinned =
-                    root.findPlayer(
-                        root.pinnedPlayerDbusName
-                    )
-
-                if (pinned !== null) {
-                    if (
-                        root.playerUsable(pinned)
-                    ) {
-                        root.rememberPlayer(pinned)
-                        return
-                    }
-
-                    const now = Date.now()
-
-                    if (
-                        root.mediaTransitionDbusName !==
-                        pinned.dbusName
-                    ) {
-                        root.mediaTransitionDbusName =
-                            pinned.dbusName
-
-                        root.mediaTransitionUntil =
-                            now + 2500
-                    }
-
-                    if (
-                        now <
-                        root.mediaTransitionUntil
-                    ) {
-                        // Keep the same source selected.
-                        // We intentionally do NOT call
-                        // rememberPlayer here because its
-                        // metadata may be temporarily empty.
-                        root.activePlayer = pinned
-                        return
-                    }
-                }
-
-                root.mediaTransitionDbusName = ""
-                root.mediaTransitionUntil = 0
-                root.pinnedPlayerDbusName = ""
-            }
-
-            // ---------------------------------
-            // Last paused session.
-            // ---------------------------------
-            const remembered =
-                root.findPlayer(
-                    root.lastPlayerDbusName
                 )
-
-            if (
-                remembered !== null &&
-                root.playerUsable(remembered)
-            ) {
-                root.rememberPlayer(remembered)
-                return
             }
 
-            // ---------------------------------
-            // Any valid paused MPRIS session.
-            // ---------------------------------
-            for (
-                let i = 0;
-                i < players.length;
-                i++
-            ) {
-                if (
-                    root.playerUsable(players[i])
-                ) {
-                    root.rememberPlayer(
-                        players[i]
+            Connections {
+                target: player
+                ignoreUnknownSignals: true
+
+                function onPlaybackStateChanged() {
+                    root.handleMediaPlaybackEvent(
+                        player
                     )
-                    return
                 }
-            }
 
-            // ---------------------------------
-            // Nothing live: persistent Local fallback.
-            // ---------------------------------
-            root.activePlayer = null
+                function onTrackChanged() {
+                    // trackChanged happens before all friendly
+                    // metadata helpers are guaranteed settled.
+                    // Wait one event-loop turn.
+                    Qt.callLater(
+                        function() {
+                            root.handleMediaTrackEvent(
+                                player
+                            )
+                        }
+                    )
+                }
 
-            if (root.lastLocalUri !== "") {
-                root.lastMediaUri =
-                    root.lastLocalUri
-
-                root.lastMediaTitle =
-                    root.lastLocalTitle
-
-                root.lastMediaArtist =
-                    root.lastLocalArtist
-
-                root.lastMediaArt =
-                    root.lastLocalArt
+                function onPostTrackChanged() {
+                    // Some players update artwork/metadata late.
+                    if (
+                        root.activePlayer !== null &&
+                        root.activePlayer.dbusName ===
+                            player.dbusName
+                    ) {
+                        root.rememberPlayer(
+                            player
+                        )
+                    }
+                }
             }
         }
     }
@@ -1980,12 +2073,56 @@ PanelWindow {
             Item {
                 id: mediaButton
 
-                width: 230
+                width:
+                    root.mediaExpanded
+                    ? 230
+                    : 32
+
                 height: 32
+
+                // Compact idle state.
+                Rectangle {
+                    anchors.fill: parent
+
+                    radius: 9
+                    color: "#313244"
+
+                    visible:
+                        !root.mediaExpanded
+
+                    Text {
+                        anchors.centerIn: parent
+                        text: "♪"
+                        color: "#89b4fa"
+                        font.pixelSize: 16
+                    }
+
+                    MouseArea {
+                        anchors.fill: parent
+                        cursorShape:
+                            Qt.PointingHandCursor
+
+                        onClicked: {
+                            // If remembered media exists,
+                            // opening the popup still works
+                            // from compact mode.
+                            if (
+                                root.activePlayer !== null ||
+                                root.lastMediaTitle !== ""
+                            ) {
+                                mediaPopup.visible =
+                                    !mediaPopup.visible
+                            }
+                        }
+                    }
+                }
 
                 Row {
                     anchors.centerIn: parent
                     spacing: 6
+
+                    visible:
+                        root.mediaExpanded
 
                     // Previous
                     Rectangle {
@@ -2832,6 +2969,17 @@ PanelWindow {
                             onPositionChanged: mouse => {
                                 if (pressed)
                                     seekTo(mouse.x)
+                            }
+
+                            onReleased: {
+                                if (
+                                    root.activePlayer !== null &&
+                                    root.playerIsLocal(
+                                        root.activePlayer
+                                    )
+                                ) {
+                                    root.saveLocalMediaState()
+                                }
                             }
                         }
                     }

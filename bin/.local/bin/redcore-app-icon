@@ -159,8 +159,11 @@ def find_desktop_icon():
                     entry.get("Icon", "").strip()
                 )
 
+                # NEVER use an unrelated desktop entry.
+                # score == 0 means there was no actual match.
                 if (
-                    candidate_icon
+                    score > 0
+                    and candidate_icon
                     and (
                         best is None
                         or score > best[0]

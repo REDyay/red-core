@@ -1,0 +1,252 @@
+#!/usr/bin/env python3
+
+import configparser
+import os
+import sys
+from pathlib import Path
+
+try:
+    terminal_pid = int(sys.argv[1])
+except Exception:
+    print("")
+    raise SystemExit(0)
+
+app_id = sys.argv[2] if len(sys.argv) > 2 else ""
+
+SHELLS = {
+    "sh", "bash", "zsh", "dash", "fish", "nu"
+}
+
+TERMINAL_NAMES = {
+    "foot", "footclient", "foot-server",
+    "kitty", "alacritty",
+    "wezterm", "wezterm-gui",
+    "ghostty", "konsole",
+    "gnome-terminal",
+    "gnome-terminal-server",
+    "xfce4-terminal",
+    "qterminal", "tilix",
+    "terminator",
+}
+
+WRAPPERS = {
+    "tmux", "screen",
+    "sudo", "doas",
+    "env"
+}
+
+
+def normalize(value):
+    return (
+        str(value)
+        .lower()
+        .replace("_", "-")
+        .replace(" ", "-")
+    )
+
+
+def is_terminal_app(app):
+    target = normalize(app)
+
+    if target in TERMINAL_NAMES:
+        return True
+
+    data_home = Path(
+        os.environ.get(
+            "XDG_DATA_HOME",
+            Path.home() / ".local/share"
+        )
+    )
+
+    data_dirs = [
+        Path(p)
+        for p in os.environ.get(
+            "XDG_DATA_DIRS",
+            "/usr/local/share:/usr/share"
+        ).split(":")
+        if p
+    ]
+
+    for base in [data_home, *data_dirs]:
+        directory = base / "applications"
+
+        if not directory.exists():
+            continue
+
+        for file in directory.glob("*.desktop"):
+            try:
+                parser = configparser.ConfigParser(
+                    interpolation=None,
+                    strict=False
+                )
+
+                parser.read(
+                    file,
+                    encoding="utf-8"
+                )
+
+                if "Desktop Entry" not in parser:
+                    continue
+
+                entry = parser["Desktop Entry"]
+
+                desktop_id = normalize(file.stem)
+                startup = normalize(
+                    entry.get(
+                        "StartupWMClass",
+                        ""
+                    )
+                )
+
+                if (
+                    desktop_id != target
+                    and not desktop_id.endswith(
+                        "." + target
+                    )
+                    and startup != target
+                ):
+                    continue
+
+                categories = normalize(
+                    entry.get(
+                        "Categories",
+                        ""
+                    )
+                )
+
+                if "terminalemulator" in categories:
+                    return True
+
+            except Exception:
+                pass
+
+    return False
+
+
+if not is_terminal_app(app_id):
+    print("")
+    raise SystemExit(0)
+
+
+def children(pid):
+    path = Path(
+        f"/proc/{pid}/task/{pid}/children"
+    )
+
+    try:
+        return [
+            int(x)
+            for x in path.read_text().split()
+        ]
+    except Exception:
+        return []
+
+
+def descendants(root):
+    result = []
+    stack = [(root, 0)]
+
+    while stack:
+        pid, depth = stack.pop()
+
+        for child in children(pid):
+            result.append(
+                (child, depth + 1)
+            )
+
+            stack.append(
+                (child, depth + 1)
+            )
+
+    return result
+
+
+def proc_info(pid):
+    try:
+        stat = Path(
+            f"/proc/{pid}/stat"
+        ).read_text()
+
+        end = stat.rfind(")")
+
+        if end < 0:
+            return None
+
+        name = stat[
+            stat.find("(") + 1:end
+        ]
+
+        fields = stat[
+            end + 2:
+        ].split()
+
+        # fields after comm:
+        # state  ppid  pgrp  session  tty_nr  tpgid ...
+        pgrp = int(fields[2])
+        tty_nr = int(fields[4])
+        tpgid = int(fields[5])
+
+        return {
+            "pid": pid,
+            "name": name,
+            "pgrp": pgrp,
+            "tty": tty_nr,
+            "tpgid": tpgid,
+        }
+
+    except Exception:
+        return None
+
+
+processes = []
+
+for pid, depth in descendants(
+    terminal_pid
+):
+    info = proc_info(pid)
+
+    if info is None:
+        continue
+
+    info["depth"] = depth
+    processes.append(info)
+
+# Only processes attached to a real TTY whose process group
+# currently owns the foreground terminal.
+foreground = [
+    p
+    for p in processes
+    if (
+        p["tty"] != 0
+        and p["tpgid"] > 0
+        and p["pgrp"] == p["tpgid"]
+    )
+]
+
+# Prefer the shallowest real foreground application.
+# This avoids selecting helper subprocesses spawned by btop/yazi/nvim.
+foreground.sort(
+    key=lambda p: (
+        p["depth"],
+        p["pid"]
+    )
+)
+
+for process in foreground:
+    name = normalize(
+        process["name"]
+    )
+
+    if (
+        name in SHELLS
+        or name in TERMINAL_NAMES
+        or name in WRAPPERS
+    ):
+        continue
+
+    print(process["name"])
+    raise SystemExit(0)
+
+# Foreground is only the shell:
+# use the terminal's normal icon.
+print("")

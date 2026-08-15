@@ -1,5 +1,6 @@
 import Quickshell
 import Quickshell.Io
+import Quickshell.Widgets
 import Quickshell.Services.Mpris
 import Quickshell.Services.Pipewire
 import QtQuick
@@ -17,6 +18,347 @@ PanelWindow {
 
     property var workspaces: []
     property int activeWorkspace: -1
+
+    // Niri windows used by the workspace app indicators.
+    property var niriWindows: []
+
+    // Generic application icon cache.
+    // app_id -> resolved image URI.
+    property var appIconCache: ({})
+    property var pendingAppIcons: ({})
+
+    // window id -> TUI app detected inside a terminal.
+    // Empty string means: use terminal's own app_id.
+    property var terminalAppCache: ({})
+
+    // Tracks whether a terminal window has received at least
+    // one valid foreground-app scan.
+    //
+    // Until then we always use the terminal's own app_id,
+    // preventing stale TUI icons from flashing on new windows.
+    property var terminalAppReady: ({})
+
+    // Window id -> first-seen timestamp.
+    // A brand-new terminal must show its REAL terminal icon
+    // while its shell/startup processes are still settling.
+    property var windowFirstSeen: ({})
+
+    function windowStartupGuardActive(window) {
+        if (
+            window === null ||
+            window === undefined
+        ) {
+            return false
+        }
+
+        const id = String(window.id)
+        const born = root.windowFirstSeen[id]
+
+        if (
+            born === undefined ||
+            born === null
+        ) {
+            return false
+        }
+
+        return (
+            Date.now() - Number(born)
+        ) < 400
+    }
+
+    function effectiveWindowAppId(window) {
+        if (
+            window === null ||
+            window === undefined
+        ) {
+            return ""
+        }
+
+        const windowId =
+            String(window.id)
+
+        // A new terminal may briefly spawn shell/prompt
+        // helper processes. Never allow those to become the
+        // displayed application icon.
+        if (
+            root.windowStartupGuardActive(window)
+        ) {
+            return String(
+                window.app_id || ""
+            )
+        }
+
+        const ready =
+            root.terminalAppReady[windowId] ===
+            true
+
+        if (ready) {
+            const detected =
+                root.terminalAppCache[windowId]
+
+            if (
+                detected !== undefined &&
+                detected !== null &&
+                String(detected) !== ""
+            ) {
+                return String(detected)
+            }
+        }
+
+        // New/unchecked terminal windows immediately use
+        // their real terminal app icon.
+        return String(
+            window.app_id || ""
+        )
+    }
+
+    function appsForWorkspace(workspaceId) {
+        const apps = []
+        const seen = ({})
+
+        for (
+            let i = 0;
+            i < root.niriWindows.length;
+            i++
+        ) {
+            const window =
+                root.niriWindows[i]
+
+            if (
+                window.workspace_id !== workspaceId
+            ) {
+                continue
+            }
+
+            const appId =
+                root.effectiveWindowAppId(
+                    window
+                )
+
+            if (
+                appId === "" ||
+                seen[appId] === true
+            ) {
+                continue
+            }
+
+            seen[appId] = true
+
+            apps.push({
+                "app_id": appId,
+                "title": window.title || ""
+            })
+        }
+
+        return apps
+    }
+
+    function desktopIconName(appId) {
+        if (!appId)
+            return ""
+
+        try {
+            const entry =
+                DesktopEntries.heuristicLookup(
+                    appId
+                )
+
+            if (
+                entry !== null &&
+                entry.icon !== ""
+            ) {
+                return entry.icon
+            }
+        } catch (error) {
+        }
+
+        return ""
+    }
+
+    function requestAppIcon(appId) {
+        if (!appId)
+            return
+
+        // Already resolved, including an intentional
+        // empty fallback result.
+        if (
+            root.appIconCache[appId] !==
+            undefined
+        ) {
+            return
+        }
+
+        // This exact app is already being resolved.
+        if (
+            root.pendingAppIcons[appId] ===
+            true
+        ) {
+            return
+        }
+
+        const iconName =
+            root.desktopIconName(appId)
+
+        // First try Quickshell / Qt icon theme.
+        // check=true prevents the purple missing texture.
+        if (iconName !== "") {
+            const themed =
+                Quickshell.iconPath(
+                    iconName,
+                    true
+                )
+
+            if (themed !== "") {
+                let cache =
+                    Object.assign(
+                        {},
+                        root.appIconCache
+                    )
+
+                cache[appId] = themed
+                root.appIconCache = cache
+                return
+            }
+        }
+
+        // IMPORTANT:
+        // If the shared resolver is already working,
+        // do NOT mark this app as pending yet.
+        //
+        // Once the current lookup finishes,
+        // processNextAppIcon() will pick this one.
+        if (appIconResolver.running)
+            return
+
+        let pending =
+            Object.assign(
+                {},
+                root.pendingAppIcons
+            )
+
+        pending[appId] = true
+        root.pendingAppIcons = pending
+
+        root.appIconResolverAppId =
+            appId
+
+        root.appIconResolverIconName =
+            iconName
+
+        appIconResolver.command = [
+            "redcore-app-icon",
+            appId,
+            iconName
+        ]
+
+        appIconResolver.running = true
+    }
+
+    function processNextAppIcon() {
+        if (appIconResolver.running)
+            return
+
+        const seen = ({})
+
+        for (
+            let i = 0;
+            i < root.niriWindows.length;
+            i++
+        ) {
+            const appId =
+                String(
+                    root.niriWindows[i].app_id ||
+                    ""
+                )
+
+            if (
+                appId === "" ||
+                seen[appId] === true
+            ) {
+                continue
+            }
+
+            seen[appId] = true
+
+            if (
+                root.appIconCache[appId] ===
+                    undefined &&
+                root.pendingAppIcons[appId] !==
+                    true
+            ) {
+                root.requestAppIcon(appId)
+
+                if (appIconResolver.running)
+                    return
+            }
+        }
+    }
+
+    function iconForApp(appId) {
+        if (!appId)
+            return ""
+
+        const cached =
+            root.appIconCache[appId]
+
+        if (
+            cached === undefined ||
+            cached === null
+        ) {
+            return ""
+        }
+
+        return String(cached)
+    }
+
+    function windowsForWorkspace(workspaceId) {
+        const result = []
+
+        for (let i = 0; i < root.niriWindows.length; i++) {
+            const window = root.niriWindows[i]
+
+            if (window.workspace_id === workspaceId)
+                result.push(window)
+        }
+
+        return result
+    }
+
+    function updateNiriWindow(window) {
+        if (
+            window === null ||
+            window === undefined
+        ) {
+            return
+        }
+
+        let list = root.niriWindows.slice()
+        let found = false
+
+        for (let i = 0; i < list.length; i++) {
+            if (list[i].id === window.id) {
+                list[i] = window
+                found = true
+                break
+            }
+        }
+
+        if (!found)
+            list.push(window)
+
+        root.niriWindows = list
+    }
+
+    function removeNiriWindow(windowId) {
+        let list = []
+
+        for (let i = 0; i < root.niriWindows.length; i++) {
+            if (root.niriWindows[i].id !== windowId)
+                list.push(root.niriWindows[i])
+        }
+
+        root.niriWindows = list
+    }
 
     // Last actually used media player.
     // We keep its metadata even if the player disappears.
@@ -1112,6 +1454,157 @@ PanelWindow {
     // NIRI WORKSPACES
     // =========================
 
+    property string appIconResolverAppId: ""
+    property string appIconResolverIconName: ""
+
+    Process {
+        id: appIconResolver
+
+        stdout: StdioCollector {
+            onStreamFinished: {
+                const appId =
+                    root.appIconResolverAppId
+
+                const result =
+                    this.text.trim()
+
+                if (appId !== "") {
+                    let cache =
+                        Object.assign(
+                            {},
+                            root.appIconCache
+                        )
+
+                    cache[appId] = result
+                    root.appIconCache = cache
+
+                    let pending =
+                        Object.assign(
+                            {},
+                            root.pendingAppIcons
+                        )
+
+                    delete pending[appId]
+
+                    root.pendingAppIcons =
+                        pending
+                }
+            }
+        }
+
+        onExited: {
+            root.appIconResolverAppId = ""
+            root.appIconResolverIconName = ""
+
+            // Wait until running has become false,
+            // then resolve the next application.
+            Qt.callLater(
+                root.processNextAppIcon
+            )
+        }
+    }
+
+    // Terminal foreground application scanner.
+    //
+    // Niri tracks windows immediately through event-stream.
+    // This small scan only handles the application running
+    // INSIDE terminal windows, because a TUI may change
+    // without generating a Niri window event.
+    function scanTerminalAppsNow() {
+        if (terminalAppScanner.running)
+            return
+
+        terminalAppScanner.command = [
+            "redcore-terminal-scan",
+            JSON.stringify(
+                root.niriWindows
+            )
+        ]
+
+        terminalAppScanner.running = true
+    }
+
+    property int terminalEventPid: 0
+
+    IpcHandler {
+        target: "redcoreTerminal"
+
+        function changed(pid: int): void {
+            root.terminalEventPid = pid
+
+            // preexec happens just before the child process
+            // starts. A tiny one-shot delay lets /proc settle.
+            terminalEventScanDelay.restart()
+        }
+    }
+
+    Timer {
+        id: terminalEventScanDelay
+
+        interval: 40
+        repeat: false
+        running: false
+
+        onTriggered: {
+            root.scanTerminalAppsNow()
+        }
+    }
+
+    Process {
+        id: terminalAppScanner
+
+        stdout: StdioCollector {
+            onStreamFinished: {
+                try {
+                    const result =
+                        JSON.parse(this.text)
+
+                    if (
+                        result !== null &&
+                        typeof result === "object"
+                    ) {
+                        root.terminalAppCache =
+                            result
+
+                        let ready =
+                            Object.assign(
+                                {},
+                                root.terminalAppReady
+                            )
+
+                        for (
+                            const windowId
+                            in result
+                        ) {
+                            ready[windowId] = true
+
+                            const appId =
+                                String(
+                                    result[windowId] ||
+                                    ""
+                                )
+
+                            if (appId !== "") {
+                                root.requestAppIcon(
+                                    appId
+                                )
+                            }
+                        }
+
+                        root.terminalAppReady =
+                            ready
+                    }
+                } catch (error) {
+                    console.log(
+                        "Terminal scan parse error:",
+                        error
+                    )
+                }
+            }
+        }
+    }
+
+
     Process {
         id: niriEvents
         running: true
@@ -1141,6 +1634,124 @@ PanelWindow {
                     ) {
                         root.activeWorkspace =
                             event.WorkspaceActivated.id
+                    }
+
+                    // Full window snapshot.
+                    if (event.WindowsChanged) {
+                        root.niriWindows =
+                            event.WindowsChanged.windows || []
+
+                        Qt.callLater(
+                            root.processNextAppIcon
+                        )
+
+                        Qt.callLater(
+                            root.scanTerminalAppsNow
+                        )
+                    }
+
+                    // Opened window, changed title/app-id,
+                    // or moved between workspaces.
+                    if (event.WindowOpenedOrChanged) {
+                        const window =
+                            event.WindowOpenedOrChanged.window
+
+                        const windowId =
+                            String(window.id)
+
+                        if (
+                            root.windowFirstSeen[windowId] ===
+                            undefined
+                        ) {
+                            let firstSeen =
+                                Object.assign(
+                                    {},
+                                    root.windowFirstSeen
+                                )
+
+                            firstSeen[windowId] =
+                                Date.now()
+
+                            root.windowFirstSeen =
+                                firstSeen
+                        }
+
+                        root.updateNiriWindow(
+                            window
+                        )
+
+                        // Never allow an old terminal foreground
+                        // application result to leak into a new
+                        // or changed Niri window state.
+                        let ready =
+                            Object.assign(
+                                {},
+                                root.terminalAppReady
+                            )
+
+                        ready[windowId] = false
+                        root.terminalAppReady = ready
+
+                        // A terminal title/process may have changed.
+                        // Scan immediately.
+                        Qt.callLater(
+                            root.scanTerminalAppsNow
+                        )
+                        if (
+                            window !== null &&
+                            window !== undefined
+                        ) {
+                            root.requestAppIcon(
+                                String(
+                                    window.app_id || ""
+                                )
+                            )
+                        }
+                    }
+
+                    // Closed window.
+                    if (event.WindowClosed) {
+                        const id =
+                            String(
+                                event.WindowClosed.id
+                            )
+
+                        root.removeNiriWindow(
+                            event.WindowClosed.id
+                        )
+
+                        let terminalCache =
+                            Object.assign(
+                                {},
+                                root.terminalAppCache
+                            )
+
+                        delete terminalCache[id]
+
+                        root.terminalAppCache =
+                            terminalCache
+
+                        let ready =
+                            Object.assign(
+                                {},
+                                root.terminalAppReady
+                            )
+
+                        delete ready[id]
+
+                        root.terminalAppReady =
+                            ready
+
+                        let firstSeen =
+                            Object.assign(
+                                {},
+                                root.windowFirstSeen
+                            )
+
+                        delete firstSeen[id]
+
+                        root.windowFirstSeen =
+                            firstSeen
                     }
 
                 } catch (error) {
@@ -1560,32 +2171,175 @@ PanelWindow {
                 model: root.workspaces
 
                 Rectangle {
+                    id: workspaceItem
+
                     required property var modelData
 
-                    width: 32
+                    property var workspaceApps:
+                        root.appsForWorkspace(
+                            modelData.id
+                        )
+
+                    property int shownApps:
+                        Math.min(
+                            3,
+                            workspaceApps.length
+                        )
+
+                    property int hiddenApps:
+                        Math.max(
+                            0,
+                            workspaceApps.length - 3
+                        )
+
+                    width:
+                        workspaceApps.length === 0
+                        ? 32
+                        : (
+                            36 +
+                            shownApps * 20 +
+                            (
+                                hiddenApps > 0
+                                ? 26
+                                : 0
+                            )
+                          )
+
                     height: 32
                     radius: 10
 
                     color:
-                        root.activeWorkspace === modelData.id
+                        root.activeWorkspace ===
+                        modelData.id
                         ? "#89b4fa"
                         : "#313244"
 
-                    Text {
+                    Row {
                         anchors.centerIn: parent
-                        text: modelData.idx
+                        spacing: 5
 
-                        color:
-                            root.activeWorkspace === modelData.id
-                            ? "#11111b"
-                            : "#cdd6f4"
+                        Text {
+                            width: 18
 
-                        font.pixelSize: 13
+                            anchors.verticalCenter:
+                                parent.verticalCenter
+
+                            horizontalAlignment:
+                                Text.AlignHCenter
+
+                            text:
+                                workspaceItem.modelData.idx
+
+                            color:
+                                root.activeWorkspace ===
+                                workspaceItem.modelData.id
+                                ? "#11111b"
+                                : "#cdd6f4"
+
+                            font.pixelSize: 13
+                        }
+
+                        Repeater {
+                            model:
+                                workspaceItem.workspaceApps
+                                    .slice(
+                                        0,
+                                        3
+                                    )
+
+                            Item {
+                                id: appIconItem
+
+                                required property var modelData
+
+                                property string appId:
+                                    String(
+                                        modelData.app_id ||
+                                        ""
+                                    )
+
+                                property string resolvedIcon:
+                                    root.iconForApp(
+                                        appIconItem.appId
+                                    )
+
+                                width: 18
+                                height: 22
+
+                                Component.onCompleted: {
+                                    root.requestAppIcon(
+                                        appIconItem.appId
+                                    )
+                                }
+
+                                onAppIdChanged: {
+                                    root.requestAppIcon(
+                                        appIconItem.appId
+                                    )
+                                }
+
+                                IconImage {
+                                    anchors.centerIn: parent
+
+                                    implicitSize: 16
+
+                                    source:
+                                        appIconItem.resolvedIcon
+
+                                    visible:
+                                        appIconItem.resolvedIcon !== ""
+                                }
+
+                                Text {
+                                    anchors.centerIn: parent
+
+                                    visible:
+                                        appIconItem.resolvedIcon === ""
+
+                                    text:
+                                        appIconItem.appId !== ""
+                                        ? appIconItem.appId
+                                            .charAt(0)
+                                            .toUpperCase()
+                                        : "?"
+
+                                    color:
+                                        root.activeWorkspace ===
+                                        workspaceItem.modelData.id
+                                        ? "#11111b"
+                                        : "#cdd6f4"
+
+                                    font.pixelSize: 10
+                                    font.bold: true
+                                }
+                            }
+                        }
+
+                        Text {
+                            visible:
+                                workspaceItem.hiddenApps > 0
+
+                            anchors.verticalCenter:
+                                parent.verticalCenter
+
+                            text:
+                                "+" +
+                                workspaceItem.hiddenApps
+
+                            color:
+                                root.activeWorkspace ===
+                                workspaceItem.modelData.id
+                                ? "#11111b"
+                                : "#cdd6f4"
+
+                            font.pixelSize: 10
+                        }
                     }
 
                     MouseArea {
                         anchors.fill: parent
-                        cursorShape: Qt.PointingHandCursor
+                        cursorShape:
+                            Qt.PointingHandCursor
 
                         onClicked: {
                             workspaceSwitch.command = [
@@ -1593,7 +2347,9 @@ PanelWindow {
                                 "msg",
                                 "action",
                                 "focus-workspace",
-                                String(modelData.idx)
+                                String(
+                                    workspaceItem.modelData.idx
+                                )
                             ]
 
                             workspaceSwitch.running = true

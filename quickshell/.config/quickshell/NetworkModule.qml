@@ -377,6 +377,33 @@ Item {
     }
 
 
+    function setAutoconnect(
+        networkData,
+        enabled
+    ) {
+        if (
+            network.actionBusy ||
+            !networkData.savedUuid
+        ) {
+            return
+        }
+
+        network.sendCommand(
+            {
+                "action":
+                    "autoconnect",
+
+                "uuid":
+                    networkData.savedUuid,
+
+                "enabled":
+                    enabled
+            },
+            true
+        )
+    }
+
+
     function forgetNetwork(
         networkData
     ) {
@@ -736,6 +763,8 @@ Item {
         }
 
         if (event === "action-result") {
+            actionProcessGuard.stop()
+
             network.actionBusy = false
 
             network.actionMessage =
@@ -894,15 +923,16 @@ Item {
 
         stdinEnabled: true
 
-        stdout: SplitParser {
-            onRead: line => {
+        stdout: StdioCollector {
+            onStreamFinished: {
                 const value =
                     String(
-                        line || ""
+                        text || ""
                     ).trim()
 
-                if (value === "")
+                if (value === "") {
                     return
+                }
 
                 try {
                     network.handleEvent(
@@ -944,7 +974,7 @@ Item {
     Timer {
         id: actionProcessGuard
 
-        interval: 150
+        interval: 750
         repeat: false
 
         onTriggered: {
@@ -1164,6 +1194,9 @@ Item {
                         }
 
                         Rectangle {
+                            visible:
+                                network.wifiAdapters.length > 1
+
                             width: 72
                             height: 28
                             radius: 8
@@ -1635,9 +1668,15 @@ Item {
                                                 width:
                                                     parent.width -
                                                     (
-                                                        forgetButton
-                                                            .visible
-                                                        ? 130
+                                                        apRow
+                                                            .modelData
+                                                            .saved
+                                                        ? (
+                                                            forgetButton
+                                                                .visible
+                                                            ? 188
+                                                            : 138
+                                                          )
                                                         : 75
                                                     )
 
@@ -1707,12 +1746,18 @@ Item {
                                             Text {
                                                 anchors {
                                                     right:
-                                                        forgetButton
+                                                        autoConnectButton
                                                             .visible
-                                                        ? forgetButton
+                                                        ? autoConnectButton
                                                             .left
-                                                        : parent
-                                                            .right
+                                                        : (
+                                                            forgetButton
+                                                                .visible
+                                                            ? forgetButton
+                                                                .left
+                                                            : parent
+                                                                .right
+                                                          )
 
                                                     rightMargin: 7
 
@@ -1747,6 +1792,92 @@ Item {
                                                     : "#a6adc8"
 
                                                 font.pixelSize: 8
+                                            }
+
+
+                                            Rectangle {
+                                                id: autoConnectButton
+
+                                                visible:
+                                                    apRow
+                                                        .modelData
+                                                        .saved
+
+                                                anchors {
+                                                    right:
+                                                        forgetButton
+                                                            .visible
+                                                        ? forgetButton
+                                                            .left
+                                                        : parent
+                                                            .right
+
+                                                    rightMargin:
+                                                        forgetButton
+                                                            .visible
+                                                        ? 6
+                                                        : 0
+
+                                                    verticalCenter:
+                                                        parent
+                                                        .verticalCenter
+                                                }
+
+                                                width: 58
+                                                height: 23
+                                                radius: 7
+
+                                                color:
+                                                    apRow
+                                                        .modelData
+                                                        .autoconnect
+                                                    ? "#89b4fa"
+                                                    : "#313244"
+
+                                                Text {
+                                                    anchors.centerIn:
+                                                        parent
+
+                                                    text:
+                                                        apRow
+                                                            .modelData
+                                                            .autoconnect
+                                                        ? "Auto On"
+                                                        : "Auto Off"
+
+                                                    color:
+                                                        apRow
+                                                            .modelData
+                                                            .autoconnect
+                                                        ? "#11111b"
+                                                        : "#a6adc8"
+
+                                                    font.pixelSize: 7
+                                                    font.bold: true
+                                                }
+
+                                                MouseArea {
+                                                    anchors.fill:
+                                                        parent
+
+                                                    enabled:
+                                                        !network
+                                                            .actionBusy
+
+                                                    cursorShape:
+                                                        Qt.PointingHandCursor
+
+                                                    onClicked: {
+                                                        network.setAutoconnect(
+                                                            apRow
+                                                                .modelData,
+
+                                                            !apRow
+                                                                .modelData
+                                                                .autoconnect
+                                                        )
+                                                    }
+                                                }
                                             }
 
 

@@ -255,6 +255,34 @@ class RedCoreNetworkService:
     # CONNECTION PROFILES
     # ========================================================
 
+    def security_mode_from_label(
+        self,
+        label,
+    ):
+        value = str(
+            label or ""
+        ).strip().upper()
+
+        if value in {
+            "",
+            "--",
+            "OPEN",
+        }:
+            return "open"
+
+        if "WPA3" in value:
+            return "sae"
+
+        if value in {
+            "WPA",
+            "WPA2",
+            "WPA/WPA2",
+        }:
+            return "wpa-psk"
+
+        return value.lower()
+
+
     def wifi_profiles(self):
         result = []
 
@@ -269,29 +297,97 @@ class RedCoreNetworkService:
                 ):
                     continue
 
-                setting = (
+                wireless = (
                     connection
                     .get_setting_wireless()
                 )
 
-                if setting is None:
+                if wireless is None:
                     continue
 
                 ssid = self.ssid_text(
-                    setting.get_ssid()
+                    wireless.get_ssid()
                 )
 
                 if not ssid:
                     continue
 
+                connection_setting = (
+                    connection
+                    .get_setting_connection()
+                )
+
+                try:
+                    autoconnect = bool(
+                        connection_setting
+                        .get_property(
+                            "autoconnect"
+                        )
+                    )
+                except Exception:
+                    autoconnect = False
+
+                try:
+                    interface_name = str(
+                        connection_setting
+                        .get_property(
+                            "interface-name"
+                        )
+                        or ""
+                    )
+                except Exception:
+                    interface_name = ""
+
+                security_mode = "open"
+
+                try:
+                    security = (
+                        connection
+                        .get_setting_wireless_security()
+                    )
+
+                    if security is not None:
+                        key_mgmt = str(
+                            security.get_property(
+                                "key-mgmt"
+                            )
+                            or ""
+                        )
+
+                        if key_mgmt == "sae":
+                            security_mode = "sae"
+
+                        elif key_mgmt in {
+                            "wpa-psk",
+                            "wpa-none",
+                        }:
+                            security_mode = "wpa-psk"
+
+                        elif key_mgmt:
+                            security_mode = key_mgmt
+
+                except Exception:
+                    pass
+
                 result.append({
                     "ssid": ssid,
+
                     "uuid":
                         connection.get_uuid()
                         or "",
+
                     "id":
                         connection.get_id()
                         or ssid,
+
+                    "autoconnect":
+                        autoconnect,
+
+                    "interfaceName":
+                        interface_name,
+
+                    "securityMode":
+                        security_mode,
                 })
 
             except Exception:
@@ -300,16 +396,76 @@ class RedCoreNetworkService:
         return result
 
 
+    def profiles_for_network(
+        self,
+        ssid,
+        security_mode="",
+        iface="",
+    ):
+        matches = []
+
+        for profile in self.wifi_profiles():
+
+            if profile["ssid"] != ssid:
+                continue
+
+            bound_iface = str(
+                profile.get(
+                    "interfaceName",
+                    ""
+                )
+            )
+
+            if (
+                iface and
+                bound_iface and
+                bound_iface != iface
+            ):
+                continue
+
+            if (
+                security_mode and
+                profile.get(
+                    "securityMode",
+                    ""
+                ) != security_mode
+            ):
+                continue
+
+            # Explicit match first, portable profile second.
+            score = (
+                2
+                if iface and
+                   bound_iface == iface
+                else 1
+                if not bound_iface
+                else 0
+            )
+
+            matches.append(
+                (score, profile)
+            )
+
+        matches.sort(
+            key=lambda item:
+                item[0],
+            reverse=True,
+        )
+
+        return [
+            item[1]
+            for item in matches
+        ]
+
+
+    # Compatibility helper for old dormant code.
     def profiles_for_ssid(
         self,
         ssid,
     ):
-        return [
-            profile
-            for profile in
-            self.wifi_profiles()
-            if profile["ssid"] == ssid
-        ]
+        return self.profiles_for_network(
+            ssid
+        )
 
 
     def find_access_point(
@@ -1813,9 +1969,17 @@ class RedCoreNetworkService:
                 ap.get_strength()
             )
 
+            security_label = (
+                self.security_name(ap)
+            )
+
             saved_profiles = (
-                self.profiles_for_ssid(
-                    ssid
+                self.profiles_for_network(
+                    ssid,
+                    self.security_mode_from_label(
+                        security_label
+                    ),
+                    device.get_iface(),
                 )
             )
 
@@ -1824,7 +1988,7 @@ class RedCoreNetworkService:
                 "strength": strength,
 
                 "security":
-                    self.security_name(ap),
+                    security_label,
 
                 "active":
                     ap == active_ap,
@@ -1837,6 +2001,19 @@ class RedCoreNetworkService:
                         saved_profiles[0]["uuid"]
                         if saved_profiles
                         else ""
+                    ),
+
+                "autoconnect":
+                    (
+                        bool(
+                            saved_profiles[0]
+                            .get(
+                                "autoconnect",
+                                False
+                            )
+                        )
+                        if saved_profiles
+                        else False
                     ),
 
                 "lastSeen":
@@ -2425,27 +2602,16 @@ class RedCoreNetworkService:
             self.request_scan_all()
             return
 
-        if action == "connect":
-            self.action_connect(
-                command
-            )
-            return
-
-        if action == "disconnect":
-            self.action_disconnect(
-                command
-            )
-            return
-
-        if action == "forget":
-            self.action_forget(
-                command
-            )
-            return
-
-        if action == "wifi":
-            self.action_wifi(
-                command
+        if action in {
+            "connect",
+            "disconnect",
+            "forget",
+            "wifi",
+            "autoconnect",
+        }:
+            self.send_error(
+                "Write actions belong to redcore-network-action",
+                action=action,
             )
             return
 

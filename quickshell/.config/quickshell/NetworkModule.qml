@@ -7,6 +7,8 @@ import QtQuick.Layouts
 Item {
     id: network
 
+    property var popupCoordinator: null
+
     implicitWidth: 68
     implicitHeight: 32
 
@@ -886,12 +888,22 @@ Item {
                 Qt.PointingHandCursor
 
             onClicked: {
-                networkPopup.visible =
-                    !networkPopup.visible
+                const opening =
+                    network.popupCoordinator !== null
+                    ? network.popupCoordinator
+                        .activePopup !== "network"
+                    : !networkPopup.visible
 
                 if (
-                    networkPopup.visible
+                    network.popupCoordinator !== null
                 ) {
+                    network.popupCoordinator
+                        .togglePopup("network")
+                } else {
+                    networkPopup.visible = opening
+                }
+
+                if (opening) {
                     network.refreshState()
 
                     if (
@@ -903,6 +915,17 @@ Item {
                     }
                 }
             }
+        }
+    }
+
+
+    Connections {
+        target: network.popupCoordinator
+
+        function onActivePopupChanged() {
+            networkPopup.visible =
+                network.popupCoordinator
+                    .activePopup === "network"
         }
     }
 
@@ -1084,6 +1107,15 @@ Item {
 
         onVisibleChanged: {
             if (!visible) {
+                if (
+                    network.popupCoordinator !== null &&
+                    network.popupCoordinator
+                        .activePopup === "network"
+                ) {
+                    network.popupCoordinator
+                        .closePopup("network")
+                }
+
                 network.passwordPrompt =
                     false
 

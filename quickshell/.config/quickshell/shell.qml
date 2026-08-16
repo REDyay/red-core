@@ -43,6 +43,10 @@ PanelWindow {
     property var keyboardLayouts: []
     property int keyboardLayoutIndex: 0
 
+    RedCoreService {
+        id: redCoreService
+    }
+
     function keyboardLayoutLabel() {
         if (
             root.keyboardLayoutIndex < 0 ||
@@ -3001,62 +3005,31 @@ PanelWindow {
             // ---------------------
             NetworkModule {
                 id: networkModule
+                popupCoordinator: redCoreService
             }
 
             // ---------------------
             // Bluetooth
-            // Placeholder
             // ---------------------
-            Rectangle {
-                width: 32
-                height: 32
-                radius: 10
-                color: "#313244"
-
-                Text {
-                    anchors.centerIn: parent
-                    text: "BT"
-                    color: "#cdd6f4"
-                    font.pixelSize: 11
-                    font.bold: true
-                }
+            BluetoothModule {
+                id: bluetoothModule
+                service: redCoreService
             }
 
             // ---------------------
             // Battery
-            // Placeholder
             // ---------------------
-            Rectangle {
-                width: 42
-                height: 32
-                radius: 10
-                color: "#313244"
-
-                Text {
-                    anchors.centerIn: parent
-                    text: "BAT"
-                    color: "#cdd6f4"
-                    font.pixelSize: 10
-                    font.bold: true
-                }
+            BatteryModule {
+                id: batteryModule
+                service: redCoreService
             }
 
             // ---------------------
-            // Brightness
-            // Placeholder
+            // Brightness (functional layout; design later)
             // ---------------------
-            Rectangle {
-                width: 32
-                height: 32
-                radius: 10
-                color: "#313244"
-
-                Text {
-                    anchors.centerIn: parent
-                    text: "☀"
-                    color: "#cdd6f4"
-                    font.pixelSize: 14
-                }
+            BrightnessModule {
+                id: brightnessModule
+                service: redCoreService
             }
 
             // ---------------------

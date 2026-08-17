@@ -485,15 +485,47 @@ fn read_sysfs_state(profiles: PowerProfileState) -> BatteryState {
         return BatteryState::unavailable(false, profiles);
     }
 
-    let percentages: Vec<f64> = directories
+    let energy_pairs: Vec<(f64, f64)> = directories
         .iter()
-        .filter_map(|path| read_number(&path.join("capacity")))
+        .filter_map(|path| {
+            Some((
+                read_number(&path.join("energy_now"))?,
+                read_number(&path.join("energy_full"))?,
+            ))
+        })
+        .filter(|(_, full)| *full > 0.0)
         .collect();
 
-    let combined_percentage = if percentages.is_empty() {
-        None
+    let charge_pairs: Vec<(f64, f64)> = directories
+        .iter()
+        .filter_map(|path| {
+            Some((
+                read_number(&path.join("charge_now"))?,
+                read_number(&path.join("charge_full"))?,
+            ))
+        })
+        .filter(|(_, full)| *full > 0.0)
+        .collect();
+
+    let combined_percentage = if energy_pairs.len() == directories.len() {
+        let current: f64 = energy_pairs.iter().map(|(current, _)| current).sum();
+        let full: f64 = energy_pairs.iter().map(|(_, full)| full).sum();
+        Some(current / full * 100.0)
+    } else if charge_pairs.len() == directories.len() {
+        let current: f64 = charge_pairs.iter().map(|(current, _)| current).sum();
+        let full: f64 = charge_pairs.iter().map(|(_, full)| full).sum();
+        Some(current / full * 100.0)
     } else {
-        Some(percentages.iter().sum::<f64>() / percentages.len() as f64)
+        let percentages: Vec<f64> = directories
+            .iter()
+            .filter_map(|path| read_number(&path.join("capacity")))
+            .collect();
+
+        if percentages.is_empty() {
+            None
+        } else {
+            Some(percentages.iter().sum::<f64>() / percentages.len() as f64)
+        }
     };
 
     let statuses: Vec<String> = directories

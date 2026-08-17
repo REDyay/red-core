@@ -83,13 +83,9 @@ async fn logind_capabilities() -> Option<(bool, bool, bool)> {
         let error = resource.await;
         eprintln!("Power D-Bus connection stopped: {error}");
     });
-    let proxy = Proxy::new(
-        LOGIN1_DESTINATION,
-        LOGIN1_PATH,
-        LOGIN1_TIMEOUT,
-        connection,
-    );
-    let power_off: Result<(String,), _> = proxy.method_call(LOGIN1_INTERFACE, "CanPowerOff", ()).await;
+    let proxy = Proxy::new(LOGIN1_DESTINATION, LOGIN1_PATH, LOGIN1_TIMEOUT, connection);
+    let power_off: Result<(String,), _> =
+        proxy.method_call(LOGIN1_INTERFACE, "CanPowerOff", ()).await;
     let reboot: Result<(String,), _> = proxy.method_call(LOGIN1_INTERFACE, "CanReboot", ()).await;
     let suspend: Result<(String,), _> = proxy.method_call(LOGIN1_INTERFACE, "CanSuspend", ()).await;
     resource.abort();

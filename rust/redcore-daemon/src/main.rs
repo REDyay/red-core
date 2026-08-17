@@ -101,9 +101,7 @@ fn bluetooth_device_kind(icon: Option<&str>, class: Option<u32>) -> String {
         "speaker"
     } else if icon.contains("keyboard") {
         "keyboard"
-    } else if icon.contains("phone") {
-        "phone"
-    } else if class.is_some_and(|value| value >> 8 & 0x1f == 0x02) {
+    } else if icon.contains("phone") || class.is_some_and(|value| value >> 8 & 0x1f == 0x02) {
         "phone"
     } else {
         "unknown"

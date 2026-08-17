@@ -26,10 +26,7 @@ impl ManagedChild {
     }
 
     fn wait(mut self) -> std::io::Result<ExitStatus> {
-        self.0
-            .take()
-            .expect("managed child should exist")
-            .wait()
+        self.0.take().expect("managed child should exist").wait()
     }
 }
 

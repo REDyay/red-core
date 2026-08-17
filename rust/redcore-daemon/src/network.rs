@@ -1646,9 +1646,7 @@ fn spawn_reaped(mut command: Command, description: &str) -> Result<(), ActionErr
         .spawn(move || {
             let _ = child.wait();
         })
-        .map_err(|error| {
-            ActionError::new(format!("Could not monitor {description}: {error}"))
-        })?;
+        .map_err(|error| ActionError::new(format!("Could not monitor {description}: {error}")))?;
     Ok(())
 }
 

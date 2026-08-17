@@ -271,7 +271,7 @@ layout {
 
 // This line starts waybar, a commonly used bar for Wayland compositors.
 // spawn-at-startup "waybar"
-spawn-at-startup "/home/red/.local/bin/redcore-start"
+spawn-at-startup "sh" "-lc" "$HOME/.local/bin/redcore-start"
 spawn-at-startup "quickshell"
 
 // To run a shell command (with variables, pipes, etc.), use spawn-sh-at-startup:

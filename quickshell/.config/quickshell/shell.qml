@@ -51,6 +51,27 @@ PanelWindow {
         id: redCoreService
     }
 
+    WallpaperPicker {
+        id: wallpaperPicker
+    }
+
+    IpcHandler {
+        target: "wallpaperPicker"
+
+        function toggle(): void {
+            wallpaperPicker.pickerVisible =
+                !wallpaperPicker.pickerVisible
+        }
+
+        function open(): void {
+            wallpaperPicker.pickerVisible = true
+        }
+
+        function close(): void {
+            wallpaperPicker.pickerVisible = false
+        }
+    }
+
     function keyboardLayoutLabel() {
         if (
             root.keyboardLayoutIndex < 0 ||

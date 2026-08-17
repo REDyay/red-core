@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+WALL_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/red-core/wallpapers"
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/red-core/wallpaper-picker"
+COLOR_DIR="$CACHE_DIR/colors_markers"
+
+mkdir -p "$WALL_DIR" "$COLOR_DIR"
+
+command -v magick >/dev/null 2>&1 || {
+    echo "redcore-wallpaper-index: ImageMagick is required" >&2
+    exit 1
+}
+
+find "$WALL_DIR" \
+    -maxdepth 1 \
+    -type f \
+    \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' -o -iname '*.webp' \) \
+    -print0 |
+while IFS= read -r -d '' file; do
+    filename="$(basename "$file")"
+
+    marker="$(
+        find "$COLOR_DIR" \
+            -maxdepth 1 \
+            -type f \
+            -name "${filename}_HEX_*" \
+            -print -quit
+    )"
+
+    # Keep cached color when the wallpaper did not change.
+    if [[ -n "$marker" && "$marker" -nt "$file" ]]; then
+        continue
+    fi
+
+    # Remove an old color marker for this wallpaper.
+    find "$COLOR_DIR" \
+        -maxdepth 1 \
+        -type f \
+        -name "${filename}_HEX_*" \
+        -delete
+
+    hex="$(
+        magick "$file" \
+            -auto-orient \
+            -modulate 100,200 \
+            -resize '1x1^' \
+            -gravity center \
+            -extent 1x1 \
+            -depth 8 \
+            -format '%[hex:p{0,0}]' \
+            info:- 2>/dev/null |
+        grep -oE '[0-9A-Fa-f]{6}' |
+        head -n 1 || true
+    )"
+
+    if [[ -n "$hex" ]]; then
+        hex="${hex^^}"
+        touch -- "$COLOR_DIR/${filename}_HEX_${hex}"
+        echo "$filename  #$hex"
+    fi
+done

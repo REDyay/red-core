@@ -1,0 +1,1667 @@
+import Quickshell
+import Quickshell.Io
+import QtQuick
+import QtQuick.Window
+import Qt.labs.folderlistmodel
+
+PanelWindow {
+    id: picker
+
+    anchors {
+        top: true
+        bottom: true
+        left: true
+        right: true
+    }
+
+    exclusiveZone: 0
+    color: "transparent"
+
+    property bool pickerVisible: false
+    visible: pickerVisible
+    focusable: pickerVisible
+
+    // ---------------------------------------------------------
+    // Same scaling idea used by the reference theme.
+    // Base design: 1920x1080.
+    // ---------------------------------------------------------
+
+    readonly property real baseScale: {
+        if (width <= 0 || height <= 0)
+            return 1.0
+
+        const rw = width / 1920.0
+        const rh = height / 1080.0
+        const r = Math.min(rw, rh)
+
+        if (r <= 1.0)
+            return Math.max(
+                0.35,
+                Math.pow(r, 0.85)
+            )
+
+        return Math.pow(r, 0.5)
+    }
+
+    function s(value) {
+        return Math.round(
+            value * picker.baseScale
+        )
+    }
+
+    // ---------------------------------------------------------
+    // Reference carousel geometry.
+    // ---------------------------------------------------------
+
+    readonly property real itemWidth:
+        picker.s(400)
+
+    readonly property real itemHeight:
+        picker.s(420)
+
+    readonly property real borderWidth:
+        picker.s(3)
+
+    readonly property real itemSpacing:
+        picker.s(10)
+
+    readonly property real skewFactor:
+        -0.35
+
+    readonly property int animationDuration:
+        500
+
+    property bool initialFocusSet: false
+    property bool initialFocusScheduled: false
+
+    property int rememberedIndex: -1
+
+    property int scrollAccum: 0
+
+    readonly property real scrollThreshold:
+        picker.s(300)
+
+    // ---------------------------------------------------------
+    // Wallpaper filters
+    // ---------------------------------------------------------
+
+    property string currentFilter: "All"
+    property string searchQuery: ""
+
+    property var colorMap: ({})
+    property int cacheVersion: 0
+
+    readonly property var filterData: [
+        { name: "All",        hex: "" },
+        { name: "Red",        hex: "#FF4500" },
+        { name: "Orange",     hex: "#FFA500" },
+        { name: "Yellow",     hex: "#FFD700" },
+        { name: "Green",      hex: "#32CD32" },
+        { name: "Blue",       hex: "#1E90FF" },
+        { name: "Purple",     hex: "#8A2BE2" },
+        { name: "Pink",       hex: "#FF69B4" },
+        { name: "Monochrome", hex: "#A9A9A9" },
+        { name: "Search",     hex: "" }
+    ]
+
+    readonly property string cacheRoot:
+        Quickshell.env("XDG_CACHE_HOME") !== ""
+        ? Quickshell.env("XDG_CACHE_HOME")
+        : Quickshell.env("HOME") + "/.cache"
+
+    readonly property string colorMarkerDirectory:
+        "file://" +
+        picker.cacheRoot +
+        "/red-core/wallpaper-picker/colors_markers"
+
+    function getHexBucket(hexStr) {
+        if (!hexStr)
+            return "Monochrome"
+
+        hexStr =
+            String(hexStr)
+                .trim()
+                .replace(/#/g, "")
+
+        if (hexStr.length > 6)
+            hexStr = hexStr.substring(0, 6)
+
+        if (hexStr.length !== 6)
+            return "Monochrome"
+
+        let r =
+            parseInt(
+                hexStr.substring(0, 2),
+                16
+            ) / 255
+
+        let g =
+            parseInt(
+                hexStr.substring(2, 4),
+                16
+            ) / 255
+
+        let b =
+            parseInt(
+                hexStr.substring(4, 6),
+                16
+            ) / 255
+
+        if (
+            isNaN(r) ||
+            isNaN(g) ||
+            isNaN(b)
+        )
+            return "Monochrome"
+
+        let max =
+            Math.max(r, g, b)
+
+        let min =
+            Math.min(r, g, b)
+
+        let d = max - min
+
+        let h = 0
+
+        let saturation =
+            max === 0
+            ? 0
+            : d / max
+
+        let value = max
+
+        if (max !== min) {
+            if (max === r) {
+                h =
+                    (g - b) / d +
+                    (g < b ? 6 : 0)
+            } else if (max === g) {
+                h =
+                    (b - r) / d + 2
+            } else {
+                h =
+                    (r - g) / d + 4
+            }
+
+            h /= 6
+        }
+
+        h *= 360
+
+        if (
+            saturation < 0.05 ||
+            value < 0.08
+        )
+            return "Monochrome"
+
+        if (h >= 345 || h < 15)
+            return "Red"
+
+        if (h >= 15 && h < 45)
+            return "Orange"
+
+        if (h >= 45 && h < 75)
+            return "Yellow"
+
+        if (h >= 75 && h < 165)
+            return "Green"
+
+        if (h >= 165 && h < 260)
+            return "Blue"
+
+        if (h >= 260 && h < 315)
+            return "Purple"
+
+        if (h >= 315 && h < 345)
+            return "Pink"
+
+        return "Monochrome"
+    }
+
+    function wallpaperMatchesFilter(fileName) {
+        if (
+            picker.currentFilter === "All" ||
+            picker.currentFilter === "Search"
+        )
+            return true
+
+        const hex =
+            picker.colorMap[
+                String(fileName)
+            ]
+
+        if (!hex) {
+            return (
+                picker.currentFilter ===
+                "Monochrome"
+            )
+        }
+
+        return (
+            picker.getHexBucket(hex) ===
+            picker.currentFilter
+        )
+    }
+
+    function processMarkers() {
+        let map = {}
+
+        for (
+            let i = 0;
+            i < markerModel.count;
+            i++
+        ) {
+            const markerName =
+                markerModel.get(
+                    i,
+                    "fileName"
+                ) || ""
+
+            if (markerName === "")
+                continue
+
+            const splitIndex =
+                markerName.lastIndexOf(
+                    "_HEX_"
+                )
+
+            if (splitIndex === -1)
+                continue
+
+            const fileName =
+                markerName.substring(
+                    0,
+                    splitIndex
+                )
+
+            const hexCode =
+                markerName.substring(
+                    splitIndex + 5
+                )
+
+            map[fileName] =
+                "#" + hexCode
+        }
+
+        picker.colorMap = map
+        picker.cacheVersion++
+
+        if (
+            picker.currentFilter !==
+            "All"
+        ) {
+            Qt.callLater(
+                picker.applyCurrentFilter
+            )
+        }
+    }
+
+    function firstMatchingIndex() {
+        for (
+            let i = 0;
+            i < wallpaperModel.count;
+            i++
+        ) {
+            const fileName =
+                wallpaperModel.get(
+                    i,
+                    "fileName"
+                ) || ""
+
+            if (
+                picker.wallpaperMatchesFilter(
+                    fileName
+                )
+            ) {
+                return i
+            }
+        }
+
+        return -1
+    }
+
+    function applyCurrentFilter() {
+        if (wallpaperModel.count <= 0)
+            return
+
+        if (
+            picker.currentFilter ===
+            "Search"
+        ) {
+            Qt.callLater(function() {
+                searchInput.forceActiveFocus()
+            })
+
+            return
+        }
+
+        const currentName =
+            view.currentIndex >= 0
+            ? (
+                wallpaperModel.get(
+                    view.currentIndex,
+                    "fileName"
+                ) || ""
+              )
+            : ""
+
+        if (
+            currentName !== "" &&
+            picker.wallpaperMatchesFilter(
+                currentName
+            )
+        ) {
+            return
+        }
+
+        const target =
+            picker.firstMatchingIndex()
+
+        if (target >= 0) {
+            view.currentIndex = target
+        }
+    }
+
+    function stepToNextValidIndex(direction) {
+        if (wallpaperModel.count <= 0)
+            return
+
+        let index =
+            view.currentIndex
+
+        for (
+            let i = 0;
+            i < wallpaperModel.count;
+            i++
+        ) {
+            index += direction
+
+            if (
+                index < 0 ||
+                index >= wallpaperModel.count
+            ) {
+                return
+            }
+
+            const fileName =
+                wallpaperModel.get(
+                    index,
+                    "fileName"
+                ) || ""
+
+            if (
+                picker.wallpaperMatchesFilter(
+                    fileName
+                )
+            ) {
+                view.currentIndex = index
+                return
+            }
+        }
+    }
+
+    onCurrentFilterChanged: {
+        Qt.callLater(function() {
+            picker.applyCurrentFilter()
+        })
+    }
+
+    property string wallpaperDirectory:
+        "file://" +
+        Quickshell.env("HOME") +
+        "/.local/share/red-core/wallpapers"
+
+    // ---------------------------------------------------------
+    // Navigation.
+    //
+    // IMPORTANT:
+    // We only change currentIndex.
+    // StrictlyEnforceRange moves the strip for us.
+    // ---------------------------------------------------------
+
+    function previousWallpaper() {
+        picker.stepToNextValidIndex(-1)
+    }
+
+    function nextWallpaper() {
+        picker.stepToNextValidIndex(1)
+    }
+
+    function applyWallpaper(url) {
+        if (!url || url === "")
+            return
+
+        let path = String(url)
+
+        if (path.startsWith("file://")) {
+            path = decodeURIComponent(
+                path.substring(7)
+            )
+        }
+
+        wallpaperApplyProcess.command = [
+            Quickshell.env("HOME") +
+                "/.local/bin/redcore-wallpaper",
+            path
+        ]
+
+        wallpaperApplyProcess.running = true
+    }
+
+    onPickerVisibleChanged: {
+        if (pickerVisible) {
+            initialFocusSet = false
+            initialFocusScheduled = false
+            restoreInitialPosition()
+        } else {
+            initialFocusSet = false
+            initialFocusScheduled = false
+        }
+    }
+
+    // ---------------------------------------------------------
+    // Wallpaper library.
+    // ---------------------------------------------------------
+
+    FolderListModel {
+        id: markerModel
+
+        folder:
+            picker.colorMarkerDirectory
+
+        showDirs: false
+
+        nameFilters: [
+            "*_HEX_*"
+        ]
+
+        onCountChanged:
+            picker.processMarkers()
+
+        onStatusChanged: {
+            if (
+                status ===
+                FolderListModel.Ready
+            ) {
+                picker.processMarkers()
+            }
+        }
+    }
+
+    FolderListModel {
+        id: wallpaperModel
+
+        folder: picker.wallpaperDirectory
+
+        nameFilters: [
+            "*.jpg",
+            "*.jpeg",
+            "*.png",
+            "*.webp",
+            "*.JPG",
+            "*.JPEG",
+            "*.PNG",
+            "*.WEBP"
+        ]
+
+        showDirs: false
+        showDotAndDotDot: false
+
+        sortField:
+            FolderListModel.Name
+
+        onCountChanged:
+            picker.restoreInitialPosition()
+    }
+
+    Process {
+        id: wallpaperApplyProcess
+
+        running: false
+
+        stdout: StdioCollector {}
+        stderr: StdioCollector {}
+    }
+
+    Timer {
+        id: scrollThrottle
+        interval: 150
+    }
+
+    // ---------------------------------------------------------
+    // Keyboard.
+    // ---------------------------------------------------------
+
+    Item {
+        anchors.fill: parent
+
+        focus: picker.pickerVisible
+
+        Keys.onLeftPressed:
+            picker.previousWallpaper()
+
+        Keys.onRightPressed:
+            picker.nextWallpaper()
+
+        Keys.onEscapePressed:
+            picker.pickerVisible = false
+    }
+
+    // ---------------------------------------------------------
+    // IMPORTANT:
+    //
+    // Original theme does NOT use the whole screen height for
+    // the picker layout.
+    //
+    // It uses a ~650px-high region centered vertically.
+    // Toolbar and carousel live inside the SAME region.
+    // ---------------------------------------------------------
+
+    Item {
+        id: contentFrame
+
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.verticalCenter:
+            parent.verticalCenter
+
+        height:
+            Math.min(
+                parent.height,
+                picker.s(650)
+            )
+
+        // =====================================================
+        // CAROUSEL
+        // =====================================================
+
+        ListView {
+            id: view
+
+            anchors.fill: parent
+
+            model: wallpaperModel
+
+            orientation:
+                ListView.Horizontal
+
+            spacing: 0
+            clip: false
+
+            interactive: true
+
+            cacheBuffer: 2000
+
+            boundsBehavior:
+                Flickable.StopAtBounds
+
+            // This is the key part from the reference.
+            highlightRangeMode:
+                ListView.StrictlyEnforceRange
+
+            preferredHighlightBegin:
+                (width / 2) -
+                (
+                    (
+                        picker.itemWidth * 1.5 +
+                        picker.itemSpacing
+                    ) / 2
+                )
+
+            preferredHighlightEnd:
+                (width / 2) +
+                (
+                    (
+                        picker.itemWidth * 1.5 +
+                        picker.itemSpacing
+                    ) / 2
+                )
+
+            highlightMoveDuration:
+                picker.initialFocusSet
+                ? picker.animationDuration
+                : 0
+
+            focus: true
+
+            onCurrentIndexChanged: {
+                if (currentIndex >= 0)
+                    picker.rememberedIndex =
+                        currentIndex
+            }
+
+            // Allows first and last wallpaper to reach
+            // the real center of the screen.
+            header: Item {
+                width:
+                    Math.max(
+                        0,
+                        view.width / 2 -
+                        (
+                            picker.itemWidth *
+                            1.5
+                        ) / 2
+                    )
+
+                height: 1
+            }
+
+            footer: Item {
+                width:
+                    Math.max(
+                        0,
+                        view.width / 2 -
+                        (
+                            picker.itemWidth *
+                            1.5
+                        ) / 2
+                    )
+
+                height: 1
+            }
+
+            // Wheel behaviour from the reference.
+            MouseArea {
+                anchors.fill: parent
+
+                acceptedButtons:
+                    Qt.NoButton
+
+                onWheel: wheel => {
+                    if (scrollThrottle.running) {
+                        wheel.accepted = true
+                        return
+                    }
+
+                    const dx =
+                        wheel.angleDelta.x
+
+                    const dy =
+                        wheel.angleDelta.y
+
+                    const delta =
+                        Math.abs(dx) >
+                        Math.abs(dy)
+                        ? dx
+                        : dy
+
+                    picker.scrollAccum +=
+                        delta
+
+                    if (
+                        Math.abs(
+                            picker.scrollAccum
+                        ) >=
+                        picker.scrollThreshold
+                    ) {
+                        if (
+                            picker.scrollAccum > 0
+                        ) {
+                            picker.previousWallpaper()
+                        } else {
+                            picker.nextWallpaper()
+                        }
+
+                        picker.scrollAccum = 0
+                        scrollThrottle.start()
+                    }
+
+                    wheel.accepted = true
+                }
+            }
+
+            delegate: Item {
+                id: delegateRoot
+
+                required property int index
+                required property string fileUrl
+                required property string fileName
+
+                readonly property bool matchesFilter:
+                    picker.wallpaperMatchesFilter(
+                        delegateRoot.fileName
+                    )
+
+                readonly property bool isCurrent:
+                    ListView.isCurrentItem &&
+                    delegateRoot.matchesFilter
+
+                // Same filter behaviour as the reference:
+                // non-matching items animate down to zero.
+                readonly property real targetWidth:
+                    isCurrent
+                    ? picker.itemWidth * 1.5
+                    : picker.itemWidth * 0.5
+
+                readonly property real targetHeight:
+                    isCurrent
+                    ? picker.itemHeight +
+                      picker.s(30)
+                    : picker.itemHeight
+
+                // Delegate owns the spacing.
+                width:
+                    delegateRoot.matchesFilter
+                    ? (
+                        targetWidth +
+                        picker.itemSpacing
+                      )
+                    : 0
+
+                height:
+                    delegateRoot.matchesFilter
+                    ? targetHeight
+                    : 0
+
+                anchors.verticalCenter:
+                    parent.verticalCenter
+
+                anchors.verticalCenterOffset:
+                    picker.s(15)
+
+                opacity:
+                    delegateRoot.matchesFilter
+                    ? (
+                        isCurrent
+                        ? 1.0
+                        : 0.6
+                      )
+                    : 0.0
+
+                scale:
+                    delegateRoot.matchesFilter
+                    ? 1.0
+                    : 0.5
+
+                visible:
+                    width > 0.1 ||
+                    opacity > 0.01
+
+                z:
+                    isCurrent
+                    ? 10
+                    : 1
+
+                // EXACT animation style from the reference.
+                Behavior on scale {
+                    enabled:
+                        picker.initialFocusSet
+
+                    NumberAnimation {
+                        duration:
+                            picker.animationDuration
+
+                        easing.type:
+                            Easing.InOutQuad
+                    }
+                }
+
+                Behavior on width {
+                    enabled:
+                        picker.initialFocusSet
+
+                    NumberAnimation {
+                        duration:
+                            picker.animationDuration
+
+                        easing.type:
+                            Easing.InOutQuad
+                    }
+                }
+
+                Behavior on height {
+                    enabled:
+                        picker.initialFocusSet
+
+                    NumberAnimation {
+                        duration:
+                            picker.animationDuration
+
+                        easing.type:
+                            Easing.InOutQuad
+                    }
+                }
+
+                Behavior on opacity {
+                    enabled:
+                        picker.initialFocusSet
+
+                    NumberAnimation {
+                        duration:
+                            picker.animationDuration
+
+                        easing.type:
+                            Easing.InOutQuad
+                    }
+                }
+
+                // Actual parallelogram.
+                Item {
+                    id: skewedCard
+
+                    anchors.centerIn: parent
+
+                    // Compensates for the extra height while
+                    // keeping skewed neighbours aligned.
+                    anchors.horizontalCenterOffset:
+                        (
+                            (
+                                picker.itemHeight -
+                                height
+                            ) / 2
+                        ) *
+                        picker.skewFactor
+
+                    width:
+                        parent.width > 0
+                        ? parent.width *
+                          (
+                            delegateRoot.targetWidth /
+                            (
+                                delegateRoot.targetWidth +
+                                picker.itemSpacing
+                            )
+                          )
+                        : 0
+
+                    height: parent.height
+
+                    transform: Matrix4x4 {
+                        matrix:
+                            Qt.matrix4x4(
+                                1,
+                                picker.skewFactor,
+                                0,
+                                0,
+
+                                0,
+                                1,
+                                0,
+                                0,
+
+                                0,
+                                0,
+                                1,
+                                0,
+
+                                0,
+                                0,
+                                0,
+                                1
+                            )
+                    }
+
+                    // Reference uses the wallpaper itself
+                    // around the inner crop, creating a very
+                    // natural thin border.
+                    Image {
+                        anchors.fill: parent
+
+                        source:
+                            delegateRoot.fileUrl
+
+                        sourceSize:
+                            Qt.size(1, 1)
+
+                        fillMode:
+                            Image.Stretch
+
+                        asynchronous: true
+                    }
+
+                    Item {
+                        anchors.fill: parent
+
+                        anchors.margins:
+                            picker.borderWidth
+
+                        clip: true
+
+                        Rectangle {
+                            anchors.fill: parent
+                            color: "#11111b"
+                        }
+
+                        // IMPORTANT:
+                        // Image dimensions stay based on MAX
+                        // selected size. The card clips it while
+                        // shrinking. This avoids ugly stretching.
+                        Image {
+                            anchors.centerIn: parent
+
+                            anchors.horizontalCenterOffset:
+                                picker.s(-50)
+
+                            width:
+                                (
+                                    picker.itemWidth *
+                                    1.5
+                                ) +
+                                (
+                                    (
+                                        picker.itemHeight +
+                                        picker.s(30)
+                                    ) *
+                                    Math.abs(
+                                        picker.skewFactor
+                                    )
+                                ) +
+                                picker.s(50)
+
+                            height:
+                                picker.itemHeight +
+                                picker.s(30)
+
+                            source:
+                                delegateRoot.fileUrl
+
+                            fillMode:
+                                Image.PreserveAspectCrop
+
+                            asynchronous: true
+                            cache: true
+
+                            // Undo the parent's shear so the
+                            // wallpaper itself is not distorted.
+                            transform: Matrix4x4 {
+                                matrix:
+                                    Qt.matrix4x4(
+                                        1,
+                                        -picker.skewFactor,
+                                        0,
+                                        0,
+
+                                        0,
+                                        1,
+                                        0,
+                                        0,
+
+                                        0,
+                                        0,
+                                        1,
+                                        0,
+
+                                        0,
+                                        0,
+                                        0,
+                                        1
+                                    )
+                            }
+                        }
+                    }
+
+                    MouseArea {
+                        anchors.fill: parent
+
+                        cursorShape:
+                            Qt.PointingHandCursor
+
+                        onClicked: {
+                            if (
+                                view.currentIndex !==
+                                delegateRoot.index
+                            ) {
+                                // ONLY change currentIndex.
+                                // No forceLayout here.
+                                view.currentIndex =
+                                    delegateRoot.index
+                            } else {
+                                picker.applyWallpaper(
+                                    delegateRoot.fileUrl
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+
+        // =====================================================
+        // TOOLBAR
+        // Reference-style Red Core wallpaper toolbar.
+        // =====================================================
+
+        Rectangle {
+            id: filterBarBackground
+
+            anchors.top: parent.top
+            anchors.topMargin:
+                picker.pickerVisible
+                ? picker.s(40)
+                : picker.s(-100)
+
+            anchors.horizontalCenter:
+                parent.horizontalCenter
+
+            opacity:
+                picker.pickerVisible
+                ? 1.0
+                : 0.0
+
+            z: 100
+
+            height: picker.s(56)
+
+            width:
+                filterRow.width +
+                picker.s(24)
+
+            radius:
+                picker.s(14)
+
+            color: "#E622222A"
+
+            border.color: "#665A5A66"
+            border.width: 1
+
+            Behavior on anchors.topMargin {
+                NumberAnimation {
+                    duration: 600
+                    easing.type:
+                        Easing.OutExpo
+                }
+            }
+
+            Behavior on opacity {
+                NumberAnimation {
+                    duration: 500
+                    easing.type:
+                        Easing.OutCubic
+                }
+            }
+
+            Behavior on width {
+                NumberAnimation {
+                    duration: 600
+                    easing.type:
+                        Easing.OutBack
+                    easing.overshoot: 0.5
+                }
+            }
+
+            Row {
+                id: filterRow
+
+                anchors.centerIn: parent
+
+                spacing:
+                    picker.s(12)
+
+                // ---------------------------------------------
+                // Local / All wallpapers
+                // ---------------------------------------------
+
+                Item {
+                    width: picker.s(44)
+                    height: picker.s(44)
+
+                    anchors.verticalCenter:
+                        parent.verticalCenter
+
+                    Rectangle {
+                        id: allButton
+
+                        anchors.centerIn: parent
+
+                        width: picker.s(36)
+                        height: picker.s(36)
+
+                        radius:
+                            picker.s(10)
+
+                        color:
+                            picker.currentFilter === "All"
+                            ? "#454550"
+                            : "transparent"
+
+                        border.color:
+                            picker.currentFilter === "All"
+                            ? "#E8E8EE"
+                            : "#665A5A66"
+
+                        border.width:
+                            picker.currentFilter === "All"
+                            ? picker.s(2)
+                            : 1
+
+                        scale:
+                            picker.currentFilter === "All"
+                            ? 1.15
+                            : (
+                                allMouse.containsMouse
+                                ? 1.08
+                                : 1.0
+                              )
+
+                        Behavior on scale {
+                            NumberAnimation {
+                                duration: 400
+                                easing.type:
+                                    Easing.OutBack
+                                easing.overshoot: 1.2
+                            }
+                        }
+
+                        Behavior on color {
+                            ColorAnimation {
+                                duration: 300
+                            }
+                        }
+
+                        // Four-square icon like reference.
+                        Item {
+                            anchors.centerIn: parent
+
+                            width: picker.s(14)
+                            height: picker.s(14)
+
+                            Repeater {
+                                model: 4
+
+                                Rectangle {
+                                    required property int index
+
+                                    width: picker.s(6)
+                                    height: picker.s(6)
+
+                                    x:
+                                        index % 2 === 0
+                                        ? 0
+                                        : picker.s(8)
+
+                                    y:
+                                        index < 2
+                                        ? 0
+                                        : picker.s(8)
+
+                                    radius:
+                                        picker.s(1)
+
+                                    color:
+                                        picker.currentFilter === "All"
+                                        ? "#FFFFFF"
+                                        : "#BFC0C8"
+                                }
+                            }
+                        }
+                    }
+
+                    MouseArea {
+                        id: allMouse
+
+                        anchors.fill: parent
+
+                        hoverEnabled: true
+                        cursorShape:
+                            Qt.PointingHandCursor
+
+                        onClicked: {
+                            picker.currentFilter = "All"
+                            view.forceActiveFocus()
+                        }
+                    }
+                }
+
+                // ---------------------------------------------
+                // Color filters
+                // ---------------------------------------------
+
+                Repeater {
+                    model: [
+                        {
+                            name: "Red",
+                            hex: "#FF4500"
+                        },
+                        {
+                            name: "Orange",
+                            hex: "#FFA500"
+                        },
+                        {
+                            name: "Yellow",
+                            hex: "#FFD700"
+                        },
+                        {
+                            name: "Green",
+                            hex: "#32CD32"
+                        },
+                        {
+                            name: "Blue",
+                            hex: "#1E90FF"
+                        },
+                        {
+                            name: "Purple",
+                            hex: "#8A2BE2"
+                        },
+                        {
+                            name: "Pink",
+                            hex: "#FF69B4"
+                        },
+                        {
+                            name: "Monochrome",
+                            hex: "#A9A9A9"
+                        }
+                    ]
+
+                    Item {
+                        id: filterItem
+
+                        required property var modelData
+
+                        width: picker.s(36)
+                        height: picker.s(44)
+
+                        anchors.verticalCenter:
+                            parent.verticalCenter
+
+                        Rectangle {
+                            anchors.centerIn: parent
+
+                            width: picker.s(28)
+                            height: picker.s(28)
+
+                            radius:
+                                picker.s(7)
+
+                            color:
+                                filterItem.modelData.hex
+
+                            border.color:
+                                picker.currentFilter ===
+                                filterItem.modelData.name
+                                ? "#FFFFFF"
+                                : "#665A5A66"
+
+                            border.width:
+                                picker.currentFilter ===
+                                filterItem.modelData.name
+                                ? picker.s(2)
+                                : 1
+
+                            scale:
+                                picker.currentFilter ===
+                                filterItem.modelData.name
+                                ? 1.15
+                                : (
+                                    filterMouse.containsMouse
+                                    ? 1.08
+                                    : 1.0
+                                  )
+
+                            Behavior on scale {
+                                NumberAnimation {
+                                    duration: 400
+
+                                    easing.type:
+                                        Easing.OutBack
+
+                                    easing.overshoot: 1.2
+                                }
+                            }
+
+                            Behavior on border.color {
+                                ColorAnimation {
+                                    duration: 300
+                                }
+                            }
+                        }
+
+                        MouseArea {
+                            id: filterMouse
+
+                            anchors.fill: parent
+
+                            hoverEnabled: true
+
+                            cursorShape:
+                                Qt.PointingHandCursor
+
+                            onClicked: {
+                                picker.currentFilter =
+                                    filterItem.modelData.name
+
+                                view.forceActiveFocus()
+                            }
+                        }
+                    }
+                }
+
+                // ---------------------------------------------
+                // Search
+                // ---------------------------------------------
+
+                Rectangle {
+                    id: searchBox
+
+                    height: picker.s(44)
+
+                    width:
+                        picker.currentFilter === "Search"
+                        ? picker.s(360)
+                        : picker.s(44)
+
+                    radius:
+                        picker.s(10)
+
+                    clip: true
+
+                    anchors.verticalCenter:
+                        parent.verticalCenter
+
+                    color:
+                        picker.currentFilter === "Search"
+                        ? "#CC454550"
+                        : "transparent"
+
+                    border.color:
+                        picker.currentFilter === "Search"
+                        ? "#E8E8EE"
+                        : "#665A5A66"
+
+                    border.width:
+                        picker.currentFilter === "Search"
+                        ? picker.s(2)
+                        : 1
+
+                    Behavior on width {
+                        NumberAnimation {
+                            duration: 600
+
+                            easing.type:
+                                Easing.OutBack
+
+                            easing.overshoot:
+                                0.5
+                        }
+                    }
+
+                    Behavior on color {
+                        ColorAnimation {
+                            duration: 400
+                            easing.type:
+                                Easing.OutQuart
+                        }
+                    }
+
+                    Behavior on border.color {
+                        ColorAnimation {
+                            duration: 400
+                        }
+                    }
+
+                    // Search icon area.
+                    Item {
+                        id: searchIconArea
+
+                        width: picker.s(44)
+                        height: picker.s(44)
+
+                        anchors.left:
+                            parent.left
+
+                        anchors.verticalCenter:
+                            parent.verticalCenter
+
+                        Rectangle {
+                            width: picker.s(13)
+                            height: picker.s(13)
+
+                            radius:
+                                width / 2
+
+                            anchors.centerIn:
+                                parent
+
+                            anchors.horizontalCenterOffset:
+                                picker.s(-2)
+
+                            anchors.verticalCenterOffset:
+                                picker.s(-2)
+
+                            color: "transparent"
+
+                            border.width:
+                                picker.s(2)
+
+                            border.color:
+                                searchMouse.containsMouse ||
+                                picker.currentFilter === "Search"
+                                ? "#FFFFFF"
+                                : "#BFC0C8"
+                        }
+
+                        Rectangle {
+                            width: picker.s(7)
+                            height: picker.s(2)
+
+                            radius: height / 2
+
+                            rotation: 45
+
+                            anchors.centerIn:
+                                parent
+
+                            anchors.horizontalCenterOffset:
+                                picker.s(6)
+
+                            anchors.verticalCenterOffset:
+                                picker.s(6)
+
+                            color:
+                                searchMouse.containsMouse ||
+                                picker.currentFilter === "Search"
+                                ? "#FFFFFF"
+                                : "#BFC0C8"
+                        }
+
+                        MouseArea {
+                            id: searchMouse
+
+                            anchors.fill: parent
+
+                            hoverEnabled: true
+
+                            cursorShape:
+                                Qt.PointingHandCursor
+
+                            onClicked: {
+                                if (
+                                    picker.currentFilter !==
+                                    "Search"
+                                ) {
+                                    picker.currentFilter =
+                                        "Search"
+
+                                    Qt.callLater(function() {
+                                        searchInput
+                                            .forceActiveFocus()
+                                    })
+                                } else {
+                                    picker.currentFilter =
+                                        "All"
+
+                                    view.forceActiveFocus()
+                                }
+                            }
+                        }
+                    }
+
+                    Text {
+                        anchors.left:
+                            searchIconArea.right
+
+                        anchors.leftMargin:
+                            picker.s(4)
+
+                        anchors.verticalCenter:
+                            parent.verticalCenter
+
+                        visible:
+                            picker.currentFilter === "Search" &&
+                            searchInput.text.length === 0 &&
+                            !searchInput.activeFocus
+
+                        text:
+                            "Search wallpapers..."
+
+                        color:
+                            "#8C8C98"
+
+                        font.pixelSize:
+                            picker.s(14)
+                    }
+
+                    TextInput {
+                        id: searchInput
+
+                        anchors.left:
+                            searchIconArea.right
+
+                        anchors.leftMargin:
+                            picker.s(4)
+
+                        anchors.right:
+                            searchSubmit.left
+
+                        anchors.rightMargin:
+                            picker.s(8)
+
+                        anchors.verticalCenter:
+                            parent.verticalCenter
+
+                        visible:
+                            picker.currentFilter === "Search"
+
+                        opacity:
+                            picker.currentFilter === "Search"
+                            ? 1.0
+                            : 0.0
+
+                        color: "#F2F2F5"
+
+                        selectionColor:
+                            "#5F5F75"
+
+                        selectedTextColor:
+                            "#FFFFFF"
+
+                        font.pixelSize:
+                            picker.s(15)
+
+                        clip: true
+
+                        onTextChanged:
+                            picker.searchQuery = text
+
+                        onAccepted: {
+                            picker.searchQuery =
+                                text.trim()
+
+                            // DuckDuckGo will be connected
+                            // in the next stage.
+                            focus = false
+                            view.forceActiveFocus()
+                        }
+
+                        Keys.onEscapePressed: {
+                            focus = false
+
+                            picker.currentFilter =
+                                "All"
+
+                            view.forceActiveFocus()
+                        }
+
+                        Behavior on opacity {
+                            NumberAnimation {
+                                duration: 400
+                                easing.type:
+                                    Easing.OutQuad
+                            }
+                        }
+                    }
+
+                    Rectangle {
+                        id: searchSubmit
+
+                        width: picker.s(32)
+                        height: picker.s(32)
+
+                        anchors.right:
+                            parent.right
+
+                        anchors.rightMargin:
+                            picker.s(7)
+
+                        anchors.verticalCenter:
+                            parent.verticalCenter
+
+                        visible:
+                            picker.currentFilter === "Search"
+
+                        opacity:
+                            picker.currentFilter === "Search"
+                            ? 1.0
+                            : 0.0
+
+                        radius:
+                            picker.s(8)
+
+                        color:
+                            submitMouse.containsMouse
+                            ? "#50505C"
+                            : "transparent"
+
+                        border.color:
+                            submitMouse.containsMouse
+                            ? "#FFFFFF"
+                            : "#665A5A66"
+
+                        border.width: 1
+
+                        Text {
+                            anchors.centerIn:
+                                parent
+
+                            text: "→"
+
+                            color:
+                                submitMouse.containsMouse
+                                ? "#FFFFFF"
+                                : "#BFC0C8"
+
+                            font.pixelSize:
+                                picker.s(18)
+                        }
+
+                        MouseArea {
+                            id: submitMouse
+
+                            anchors.fill: parent
+
+                            hoverEnabled: true
+
+                            cursorShape:
+                                Qt.PointingHandCursor
+
+                            onClicked: {
+                                picker.searchQuery =
+                                    searchInput.text.trim()
+
+                                searchInput.focus = false
+                                view.forceActiveFocus()
+                            }
+                        }
+
+                        Behavior on opacity {
+                            NumberAnimation {
+                                duration: 400
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

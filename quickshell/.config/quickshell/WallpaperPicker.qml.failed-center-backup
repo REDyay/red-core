@@ -1,0 +1,632 @@
+import Quickshell
+import Quickshell.Io
+import QtQuick
+import QtQuick.Layouts
+import Qt.labs.folderlistmodel
+
+PanelWindow {
+    id: picker
+
+    anchors {
+        top: true
+        bottom: true
+        left: true
+        right: true
+    }
+
+    exclusiveZone: 0
+    color: "transparent"
+
+    property bool pickerVisible: false
+    visible: pickerVisible
+
+    focusable: pickerVisible
+
+    property bool initialIndexSet: false
+
+    property string wallpaperDirectory:
+        "file://" + Quickshell.env("HOME") +
+        "/.local/share/red-core/wallpapers"
+
+    // Visual values taken from the behaviour of the reference picker.
+    readonly property real skewFactor: -0.30
+
+    readonly property int normalWidth: 145
+    readonly property int selectedWidth: 330
+
+    readonly property int normalHeight: 275
+    readonly property int selectedHeight: 285
+
+    readonly property int animationDuration: 500
+
+    function targetContentX(index) {
+        if (index < 0)
+            return 0
+
+        return index * (
+            picker.normalWidth +
+            carousel.spacing
+        )
+    }
+
+    function centerCurrentWallpaper(animate) {
+        if (
+            wallpaperModel.count <= 0 ||
+            carousel.currentIndex < 0
+        )
+            return
+
+        const target =
+            picker.targetContentX(
+                carousel.currentIndex
+            )
+
+        if (animate === false) {
+            centerAnimation.stop()
+            carousel.contentX = target
+            return
+        }
+
+        centerAnimation.stop()
+        centerAnimation.from =
+            carousel.contentX
+        centerAnimation.to =
+            target
+        centerAnimation.start()
+    }
+
+    function previousWallpaper() {
+        if (
+            wallpaperModel.count <= 0 ||
+            carousel.currentIndex <= 0
+        )
+            return
+
+        carousel.currentIndex--
+        picker.centerCurrentWallpaper(true)
+    }
+
+    function nextWallpaper() {
+        if (
+            wallpaperModel.count <= 0 ||
+            carousel.currentIndex >=
+                wallpaperModel.count - 1
+        )
+            return
+
+        carousel.currentIndex++
+        picker.centerCurrentWallpaper(true)
+    }
+
+    function applyWallpaper(url) {
+        if (!url || url === "")
+            return
+
+        let path = String(url)
+
+        if (path.startsWith("file://"))
+            path = decodeURIComponent(
+                path.substring(7)
+            )
+
+        wallpaperApplyProcess.command = [
+            Quickshell.env("HOME") +
+                "/.local/bin/redcore-wallpaper",
+            path
+        ]
+
+        wallpaperApplyProcess.running = true
+    }
+
+    function initializeIndex() {
+        if (
+            initialIndexSet ||
+            wallpaperModel.count <= 0
+        )
+            return
+
+        initialIndexSet = true
+
+        Qt.callLater(function() {
+            carousel.currentIndex =
+                Math.floor(
+                    wallpaperModel.count / 2
+                )
+
+            picker.centerCurrentWallpaper(false)
+        })
+    }
+
+    FolderListModel {
+        id: wallpaperModel
+
+        folder: picker.wallpaperDirectory
+
+        nameFilters: [
+            "*.jpg",
+            "*.jpeg",
+            "*.png",
+            "*.webp",
+            "*.JPG",
+            "*.JPEG",
+            "*.PNG",
+            "*.WEBP"
+        ]
+
+        showDirs: false
+        showDotAndDotDot: false
+
+        sortField: FolderListModel.Name
+
+        onCountChanged:
+            picker.initializeIndex()
+    }
+
+    Process {
+        id: wallpaperApplyProcess
+
+        running: false
+
+        stdout: StdioCollector {}
+        stderr: StdioCollector {}
+    }
+
+    // ---------------------------------------------------------
+    // Keyboard control
+    // ---------------------------------------------------------
+
+    Item {
+        id: keyboardController
+
+        anchors.fill: parent
+
+        focus: picker.pickerVisible
+
+        Keys.onLeftPressed:
+            picker.previousWallpaper()
+
+        Keys.onRightPressed:
+            picker.nextWallpaper()
+
+        Keys.onEscapePressed:
+            picker.pickerVisible = false
+    }
+
+    // ---------------------------------------------------------
+    // Small floating toolbar
+    // ---------------------------------------------------------
+
+    Rectangle {
+        id: toolbar
+
+        anchors.horizontalCenter:
+            parent.horizontalCenter
+
+        y: Math.max(
+            68,
+            parent.height * 0.17
+        )
+
+        width: 390
+        height: 42
+
+        radius: 12
+
+        color: "#dd202027"
+
+        border.width: 1
+        border.color: "#665f5f68"
+
+        z: 100
+
+        Row {
+            anchors.centerIn: parent
+
+            spacing: 8
+
+            Rectangle {
+                width: 32
+                height: 30
+
+                radius: 8
+
+                color: "#454550"
+
+                Text {
+                    anchors.centerIn: parent
+
+                    text: "▦"
+
+                    color: "#ffffff"
+                    font.pixelSize: 16
+                }
+            }
+
+            Text {
+                anchors.verticalCenter:
+                    parent.verticalCenter
+
+                text: "▶"
+
+                color: "#a5a5ad"
+                font.pixelSize: 12
+            }
+
+            Repeater {
+                model: [
+                    "#ff4b00",
+                    "#ffa500",
+                    "#ffd400",
+                    "#39b54a",
+                    "#2196f3",
+                    "#8d43c7",
+                    "#ef5da8",
+                    "#aaaaaa"
+                ]
+
+                Rectangle {
+                    required property var modelData
+
+                    width: 23
+                    height: 23
+
+                    radius: 6
+
+                    anchors.verticalCenter:
+                        parent.verticalCenter
+
+                    color: modelData
+                }
+            }
+
+            Text {
+                anchors.verticalCenter:
+                    parent.verticalCenter
+
+                text: "⌕"
+
+                color: "#dddddf"
+                font.pixelSize: 18
+            }
+        }
+    }
+
+    // ---------------------------------------------------------
+    // Wallpaper strip
+    // ---------------------------------------------------------
+
+    Item {
+        id: carouselArea
+
+        anchors.left: parent.left
+        anchors.right: parent.right
+
+        y: parent.height * 0.30
+
+        height:
+            Math.min(
+                340,
+                parent.height * 0.48
+            )
+
+        z: 20
+
+        ListView {
+            id: carousel
+
+            anchors.fill: parent
+
+            orientation:
+                ListView.Horizontal
+
+            model: wallpaperModel
+
+            clip: false
+
+            spacing: -12
+
+            cacheBuffer: 900
+
+            interactive: false
+
+            highlightRangeMode:
+                ListView.NoHighlightRange
+
+            header: Item {
+                width:
+                    Math.max(
+                        0,
+                        carousel.width / 2 -
+                        picker.selectedWidth / 2
+                    )
+
+                height: 1
+            }
+
+            footer: Item {
+                width:
+                    Math.max(
+                        0,
+                        carousel.width / 2 -
+                        picker.selectedWidth / 2
+                    )
+
+                height: 1
+            }
+
+            NumberAnimation {
+                id: centerAnimation
+
+                target: carousel
+                property: "contentX"
+
+                duration:
+                    picker.animationDuration
+
+                easing.type:
+                    Easing.OutCubic
+            }
+
+            boundsBehavior:
+                Flickable.StopAtBounds
+
+            flickDeceleration: 3200
+
+            delegate: Item {
+                id: delegateRoot
+
+                required property int index
+                required property string fileUrl
+                required property string fileName
+
+                readonly property bool selected:
+                    ListView.isCurrentItem
+
+                width:
+                    selected
+                    ? picker.selectedWidth
+                    : picker.normalWidth
+
+                height:
+                    carouselArea.height
+
+                Behavior on width {
+                    NumberAnimation {
+                        duration:
+                            picker.animationDuration
+
+                        easing.type:
+                            Easing.OutCubic
+                    }
+                }
+
+                Item {
+                    id: verticalCenter
+
+                    anchors.centerIn: parent
+
+                    width: parent.width
+
+                    height:
+                        delegateRoot.selected
+                        ? picker.selectedHeight
+                        : picker.normalHeight
+
+                    opacity:
+                        delegateRoot.selected
+                        ? 1.0
+                        : 0.96
+
+                    Behavior on height {
+                        NumberAnimation {
+                            duration:
+                                picker.animationDuration
+
+                            easing.type:
+                                Easing.OutCubic
+                        }
+                    }
+
+                    Behavior on opacity {
+                        NumberAnimation {
+                            duration: 250
+                        }
+                    }
+
+                    // -------------------------------------------------
+                    // The actual skewed card.
+                    //
+                    // We shear the outer card, then shear the image
+                    // in the opposite direction.
+                    // -------------------------------------------------
+
+                    Item {
+                        id: skewedCard
+
+                        anchors.fill: parent
+
+                        clip: true
+
+                        transform: Matrix4x4 {
+                            matrix:
+                                Qt.matrix4x4(
+                                    1,
+                                    picker.skewFactor,
+                                    0,
+                                    0,
+
+                                    0,
+                                    1,
+                                    0,
+                                    0,
+
+                                    0,
+                                    0,
+                                    1,
+                                    0,
+
+                                    0,
+                                    0,
+                                    0,
+                                    1
+                                )
+                        }
+
+                        Rectangle {
+                            anchors.fill: parent
+
+                            color: "#18181d"
+
+                            border.width:
+                                delegateRoot.selected
+                                ? 2
+                                : 1
+
+                            border.color:
+                                delegateRoot.selected
+                                ? "#aa8b72be"
+                                : "#805f5470"
+                        }
+
+                        Item {
+                            id: correctedImage
+
+                            // Extra horizontal area is needed because
+                            // the inverse shear moves image corners.
+                            x: -80
+
+                            width:
+                                parent.width + 160
+
+                            height:
+                                parent.height
+
+                            transform: Matrix4x4 {
+                                matrix:
+                                    Qt.matrix4x4(
+                                        1,
+                                        -picker.skewFactor,
+                                        0,
+                                        0,
+
+                                        0,
+                                        1,
+                                        0,
+                                        0,
+
+                                        0,
+                                        0,
+                                        1,
+                                        0,
+
+                                        0,
+                                        0,
+                                        0,
+                                        1
+                                    )
+                            }
+
+                            Image {
+                                anchors.fill: parent
+
+                                source:
+                                    delegateRoot.fileUrl
+
+                                fillMode:
+                                    Image.PreserveAspectCrop
+
+                                asynchronous: true
+                                cache: true
+
+                                sourceSize.width: 700
+                                sourceSize.height: 450
+                            }
+                        }
+
+                        Rectangle {
+                            anchors.fill: parent
+
+                            color:
+                                delegateRoot.selected
+                                ? "transparent"
+                                : "#10000000"
+                        }
+
+                        MouseArea {
+                            anchors.fill: parent
+
+                            hoverEnabled: true
+
+                            cursorShape:
+                                Qt.PointingHandCursor
+
+                            onClicked: {
+                                if (
+                                    carousel.currentIndex !==
+                                    delegateRoot.index
+                                ) {
+                                    carousel.currentIndex =
+                                        delegateRoot.index
+
+                                    picker.centerCurrentWallpaper()
+                                } else {
+                                    picker.applyWallpaper(
+                                        delegateRoot.fileUrl
+                                    )
+                                }
+                            }
+
+                            onWheel: wheel => {
+                                if (
+                                    wheel.angleDelta.y < 0
+                                ) {
+                                    picker.nextWallpaper()
+                                } else {
+                                    picker.previousWallpaper()
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            Component.onCompleted:
+                picker.initializeIndex()
+        }
+    }
+
+    // Mouse wheel also works in empty portions of the strip.
+    MouseArea {
+        anchors.fill: carouselArea
+
+        z: 5
+
+        acceptedButtons:
+            Qt.NoButton
+
+        onWheel: wheel => {
+            if (wheel.angleDelta.y < 0)
+                picker.nextWallpaper()
+            else
+                picker.previousWallpaper()
+        }
+    }
+
+    // Small close hint only while developing.
+    Text {
+        anchors.right: parent.right
+        anchors.bottom: parent.bottom
+
+        anchors.rightMargin: 24
+        anchors.bottomMargin: 18
+
+        text: "Esc"
+
+        color: "#88ffffff"
+
+        font.pixelSize: 10
+    }
+
+    Component.onCompleted:
+        picker.initializeIndex()
+}

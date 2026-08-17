@@ -767,6 +767,10 @@ mod tests {
             percentage: None,
             max_value: None,
             delta: None,
+            workspace_index: None,
+            app_id: None,
+            icon_name: None,
+            windows: None,
         }
     }
 

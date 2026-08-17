@@ -70,6 +70,15 @@ Item {
     property int systemMonitorDownloadSpeed: 0
     property int systemMonitorUploadSpeed: 0
 
+    // Niri workspace/window state is owned by the same Rust service.
+    property bool workspacesServiceAvailable: false
+    property bool workspacesAvailable: false
+    property var workspaces: []
+    property int activeWorkspace: -1
+    property var workspaceWindows: []
+    property var keyboardLayouts: []
+    property int keyboardLayoutIndex: 0
+
     readonly property string daemonLauncher:
         "daemon=\"${REDCORE_DAEMON:-}\"; " +
         "if [ -z \"$daemon\" ] && [ -x \"$HOME/.local/lib/red-core/redcore-daemon\" ]; then " +
@@ -100,6 +109,10 @@ Item {
     signal bluetoothActionResult(var data)
     signal batteryActionResult(var data)
     signal brightnessActionResult(var data)
+    signal workspacesStateEvent(var data)
+    signal workspacesActionResult(var data)
+    signal appIconResult(var data)
+    signal terminalAppsResult(var data)
 
 
     function sendCommand(data) {
@@ -267,6 +280,45 @@ Item {
             return
         }
 
+        if (event === "workspaces-state") {
+            service.restartDelay = 1500
+            service.workspacesServiceAvailable =
+                data.serviceAvailable === true
+            service.workspacesAvailable =
+                data.available === true
+            service.workspaces =
+                Array.isArray(data.workspaces)
+                ? data.workspaces
+                : []
+            service.activeWorkspace =
+                data.activeWorkspace === undefined ||
+                data.activeWorkspace === null
+                ? -1
+                : Number(data.activeWorkspace)
+            service.workspaceWindows =
+                Array.isArray(data.windows)
+                ? data.windows
+                : []
+            service.keyboardLayouts =
+                Array.isArray(data.keyboardLayouts)
+                ? data.keyboardLayouts
+                : []
+            service.keyboardLayoutIndex =
+                Number(data.keyboardLayoutIndex || 0)
+            service.workspacesStateEvent(data)
+            return
+        }
+
+        if (event === "app-icon-result") {
+            service.appIconResult(data)
+            return
+        }
+
+        if (event === "terminal-apps-result") {
+            service.terminalAppsResult(data)
+            return
+        }
+
         if (event === "bluetooth-action-result") {
             service.bluetoothActionResult(data)
             return
@@ -277,6 +329,9 @@ Item {
 
         if (event === "brightness-action-result")
             service.brightnessActionResult(data)
+
+        if (event === "workspaces-action-result")
+            service.workspacesActionResult(data)
     }
 
 
@@ -338,6 +393,13 @@ Item {
             service.systemMonitorNetworkType = "none"
             service.systemMonitorDownloadSpeed = 0
             service.systemMonitorUploadSpeed = 0
+            service.workspacesServiceAvailable = false
+            service.workspacesAvailable = false
+            service.workspaces = []
+            service.activeWorkspace = -1
+            service.workspaceWindows = []
+            service.keyboardLayouts = []
+            service.keyboardLayoutIndex = 0
 
             restartTimer.interval =
                 service.restartDelay

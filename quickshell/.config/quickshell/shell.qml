@@ -36,12 +36,16 @@ PanelWindow {
     focusable:
         networkModule.keyboardInputActive
 
-    property var workspaces: []
-    property int activeWorkspace: -1
+    readonly property var workspaces:
+        redCoreService.workspaces
+    readonly property int activeWorkspace:
+        redCoreService.activeWorkspace
 
     // Keyboard layout state from Niri.
-    property var keyboardLayouts: []
-    property int keyboardLayoutIndex: 0
+    readonly property var keyboardLayouts:
+        redCoreService.keyboardLayouts
+    readonly property int keyboardLayoutIndex:
+        redCoreService.keyboardLayoutIndex
 
     RedCoreService {
         id: redCoreService
@@ -136,7 +140,8 @@ PanelWindow {
     }
 
     // Niri windows used by the workspace app indicators.
-    property var niriWindows: []
+    readonly property var niriWindows:
+        redCoreService.workspaceWindows
 
     // Generic application icon cache.
     // app_id -> resolved image URI.
@@ -435,7 +440,7 @@ PanelWindow {
         //
         // Once the current lookup finishes,
         // processNextAppIcon() will pick this one.
-        if (appIconResolver.running)
+        if (root.appIconResolverBusy)
             return
 
         let pending =
@@ -450,20 +455,23 @@ PanelWindow {
         root.appIconResolverAppId =
             appId
 
-        root.appIconResolverIconName =
-            iconName
+        root.appIconResolverBusy = true
 
-        appIconResolver.command = [
-            "redcore-app-icon",
-            appId,
-            iconName
-        ]
-
-        appIconResolver.running = true
+        if (!redCoreService.sendCommand({
+            "module": "workspaces",
+            "action": "resolve-app-icon",
+            "appId": appId,
+            "iconName": iconName
+        })) {
+            root.appIconResolverBusy = false
+            root.appIconResolverAppId = ""
+            delete pending[appId]
+            root.pendingAppIcons = pending
+        }
     }
 
     function processNextAppIcon() {
-        if (appIconResolver.running)
+        if (root.appIconResolverBusy)
             return
 
         const seen = ({})
@@ -496,7 +504,38 @@ PanelWindow {
             ) {
                 root.requestAppIcon(appId)
 
-                if (appIconResolver.running)
+                if (root.appIconResolverBusy)
+                    return
+            }
+        }
+
+        // A detected TUI application is not necessarily present in
+        // Niri's app_id list, so include it in the serial retry queue.
+        for (const windowId in root.terminalAppCache) {
+            const appId =
+                String(
+                    root.terminalAppCache[windowId] ||
+                    ""
+                )
+
+            if (
+                appId === "" ||
+                seen[appId] === true
+            ) {
+                continue
+            }
+
+            seen[appId] = true
+
+            if (
+                root.appIconCache[appId] ===
+                    undefined &&
+                root.pendingAppIcons[appId] !==
+                    true
+            ) {
+                root.requestAppIcon(appId)
+
+                if (root.appIconResolverBusy)
                     return
             }
         }
@@ -530,42 +569,6 @@ PanelWindow {
         }
 
         return result
-    }
-
-    function updateNiriWindow(window) {
-        if (
-            window === null ||
-            window === undefined
-        ) {
-            return
-        }
-
-        let list = root.niriWindows.slice()
-        let found = false
-
-        for (let i = 0; i < list.length; i++) {
-            if (list[i].id === window.id) {
-                list[i] = window
-                found = true
-                break
-            }
-        }
-
-        if (!found)
-            list.push(window)
-
-        root.niriWindows = list
-    }
-
-    function removeNiriWindow(windowId) {
-        let list = []
-
-        for (let i = 0; i < root.niriWindows.length; i++) {
-            if (root.niriWindows[i].id !== windowId)
-                list.push(root.niriWindows[i])
-        }
-
-        root.niriWindows = list
     }
 
     // Last actually used media player.
@@ -1737,73 +1740,33 @@ PanelWindow {
     // =========================
 
     property string appIconResolverAppId: ""
-    property string appIconResolverIconName: ""
-
-    Process {
-        id: appIconResolver
-
-        stdout: StdioCollector {
-            onStreamFinished: {
-                const appId =
-                    root.appIconResolverAppId
-
-                const result =
-                    this.text.trim()
-
-                if (appId !== "") {
-                    let cache =
-                        Object.assign(
-                            {},
-                            root.appIconCache
-                        )
-
-                    cache[appId] = result
-                    root.appIconCache = cache
-
-                    let pending =
-                        Object.assign(
-                            {},
-                            root.pendingAppIcons
-                        )
-
-                    delete pending[appId]
-
-                    root.pendingAppIcons =
-                        pending
-                }
-            }
-        }
-
-        onExited: {
-            root.appIconResolverAppId = ""
-            root.appIconResolverIconName = ""
-
-            // Wait until running has become false,
-            // then resolve the next application.
-            Qt.callLater(
-                root.processNextAppIcon
-            )
-        }
-    }
+    property bool appIconResolverBusy: false
+    property bool terminalScanBusy: false
+    property bool terminalScanPending: false
 
     // Terminal foreground application scanner.
     //
-    // Niri tracks windows immediately through event-stream.
-    // This small scan only handles the application running
-    // INSIDE terminal windows, because a TUI may change
-    // without generating a Niri window event.
+    // Rust reads /proc only when a relevant Niri or terminal
+    // event occurs; there is no continuous polling.
     function scanTerminalAppsNow() {
-        if (terminalAppScanner.running)
+        if (!redCoreService.workspacesAvailable)
             return
 
-        terminalAppScanner.command = [
-            "redcore-terminal-scan",
-            JSON.stringify(
-                root.niriWindows
-            )
-        ]
+        if (root.terminalScanBusy) {
+            root.terminalScanPending = true
+            return
+        }
 
-        terminalAppScanner.running = true
+        root.terminalScanBusy = true
+        root.terminalScanPending = false
+
+        if (!redCoreService.sendCommand({
+            "module": "workspaces",
+            "action": "scan-terminal-apps",
+            "windows": root.niriWindows
+        })) {
+            root.terminalScanBusy = false
+        }
     }
 
     property int terminalEventPid: 0
@@ -1832,378 +1795,178 @@ PanelWindow {
         }
     }
 
-    Process {
-        id: terminalAppScanner
+    Connections {
+        target: redCoreService
 
-        stdout: StdioCollector {
-            onStreamFinished: {
-                try {
-                    const result =
-                        JSON.parse(this.text)
+        function onRunningChanged() {
+            if (redCoreService.running)
+                return
 
-                    if (
-                        result !== null &&
-                        typeof result === "object"
-                    ) {
-                        root.terminalAppCache =
-                            result
+            root.appIconResolverAppId = ""
+            root.appIconResolverBusy = false
+            root.pendingAppIcons = ({})
+            root.terminalScanBusy = false
+            root.terminalScanPending = false
+        }
 
-                        let ready =
-                            Object.assign(
-                                {},
-                                root.terminalAppReady
-                            )
+        function onAppIconResult(data) {
+            const appId =
+                String(data.appId || "")
 
-                        for (
-                            const windowId
-                            in result
-                        ) {
-                            ready[windowId] = true
-
-                            const appId =
-                                String(
-                                    result[windowId] ||
-                                    ""
-                                )
-
-                            if (appId !== "") {
-                                root.requestAppIcon(
-                                    appId
-                                )
-                            }
-                        }
-
-                        root.terminalAppReady =
-                            ready
-                    }
-                } catch (error) {
-                    console.log(
-                        "Terminal scan parse error:",
-                        error
+            if (appId !== "") {
+                let cache =
+                    Object.assign(
+                        {},
+                        root.appIconCache
                     )
-                }
+
+                cache[appId] =
+                    String(data.icon || "")
+                root.appIconCache = cache
+
+                let pending =
+                    Object.assign(
+                        {},
+                        root.pendingAppIcons
+                    )
+
+                delete pending[appId]
+                root.pendingAppIcons = pending
             }
+
+            root.appIconResolverAppId = ""
+            root.appIconResolverBusy = false
+            Qt.callLater(root.processNextAppIcon)
         }
-    }
 
+        function onTerminalAppsResult(data) {
+            const result =
+                data.apps || ({})
 
-    Process {
-        id: niriEvents
-        running: true
-        command: ["niri", "msg", "--json", "event-stream"]
+            root.terminalAppCache = result
 
-        stdout: SplitParser {
-            onRead: line => {
-                try {
-                    const event = JSON.parse(line)
+            let ready =
+                Object.assign(
+                    {},
+                    root.terminalAppReady
+                )
 
-                    if (event.WorkspacesChanged) {
-                        const list = event.WorkspacesChanged.workspaces
+            for (const windowId in result) {
+                ready[windowId] = true
 
-                        list.sort((a, b) => a.idx - b.idx)
-                        root.workspaces = list
+                const appId =
+                    String(result[windowId] || "")
 
-                        for (const workspace of list) {
-                            if (workspace.is_focused) {
-                                root.activeWorkspace = workspace.id
-                            }
-                        }
-                    }
+                if (appId !== "")
+                    root.requestAppIcon(appId)
+            }
+
+            root.terminalAppReady = ready
+            root.terminalScanBusy = false
+
+            if (root.terminalScanPending)
+                Qt.callLater(root.scanTerminalAppsNow)
+        }
+
+        function onWorkspacesStateEvent(data) {
+            const reason =
+                String(data.reason || "")
+
+            if (!redCoreService.workspacesAvailable) {
+                root.appIconResolverAppId = ""
+                root.appIconResolverBusy = false
+                root.pendingAppIcons = ({})
+                root.terminalAppCache = ({})
+                root.terminalAppReady = ({})
+                root.windowFirstSeen = ({})
+                root.terminalScanBusy = false
+                root.terminalScanPending = false
+                return
+            }
+
+            if (reason === "windows-changed") {
+                Qt.callLater(root.processNextAppIcon)
+                Qt.callLater(root.scanTerminalAppsNow)
+                return
+            }
+
+            if (reason === "window-opened-or-changed") {
+                const windowId =
+                    String(data.windowId || "")
+
+                if (
+                    windowId !== "" &&
+                    root.windowFirstSeen[windowId] ===
+                        undefined
+                ) {
+                    let firstSeen =
+                        Object.assign(
+                            {},
+                            root.windowFirstSeen
+                        )
+                    firstSeen[windowId] = Date.now()
+                    root.windowFirstSeen = firstSeen
+                }
+
+                let ready =
+                    Object.assign(
+                        {},
+                        root.terminalAppReady
+                    )
+                ready[windowId] = false
+                root.terminalAppReady = ready
+
+                for (
+                    let i = 0;
+                    i < root.niriWindows.length;
+                    i++
+                ) {
+                    const window =
+                        root.niriWindows[i]
 
                     if (
-                        event.WorkspaceActivated &&
-                        event.WorkspaceActivated.focused
+                        String(window.id) ===
+                        windowId
                     ) {
-                        root.activeWorkspace =
-                            event.WorkspaceActivated.id
-                    }
-
-                    // Keyboard layouts full snapshot/config change.
-                    if (event.KeyboardLayoutsChanged) {
-                        const wrapper =
-                            event.KeyboardLayoutsChanged
-
-                        const data =
-                            wrapper.keyboard_layouts || {}
-
-                        root.keyboardLayouts =
-                            data.names || []
-
-                        if (
-                            data.current_idx !== undefined
-                        ) {
-                            root.keyboardLayoutIndex =
-                                data.current_idx
-                        }
-                    }
-
-                    // Active keyboard layout changed.
-                    if (event.KeyboardLayoutSwitched) {
-                        const data =
-                            event.KeyboardLayoutSwitched
-
-                        if (
-                            data.idx !== undefined
-                        ) {
-                            root.keyboardLayoutIndex =
-                                data.idx
-                        }
-                    }
-
-                    // Full window snapshot.
-                    if (event.WindowsChanged) {
-                        root.niriWindows =
-                            event.WindowsChanged.windows || []
-
-                        Qt.callLater(
-                            root.processNextAppIcon
+                        root.requestAppIcon(
+                            String(window.app_id || "")
                         )
-
-                        Qt.callLater(
-                            root.scanTerminalAppsNow
-                        )
+                        break
                     }
-
-                    // Opened window, changed title/app-id,
-                    // or moved between workspaces.
-                    if (event.WindowOpenedOrChanged) {
-                        const window =
-                            event.WindowOpenedOrChanged.window
-
-                        const windowId =
-                            String(window.id)
-
-                        if (
-                            root.windowFirstSeen[windowId] ===
-                            undefined
-                        ) {
-                            let firstSeen =
-                                Object.assign(
-                                    {},
-                                    root.windowFirstSeen
-                                )
-
-                            firstSeen[windowId] =
-                                Date.now()
-
-                            root.windowFirstSeen =
-                                firstSeen
-                        }
-
-                        root.updateNiriWindow(
-                            window
-                        )
-
-                        // Never allow an old terminal foreground
-                        // application result to leak into a new
-                        // or changed Niri window state.
-                        let ready =
-                            Object.assign(
-                                {},
-                                root.terminalAppReady
-                            )
-
-                        ready[windowId] = false
-                        root.terminalAppReady = ready
-
-                        // A terminal title/process may have changed.
-                        // Scan immediately.
-                        Qt.callLater(
-                            root.scanTerminalAppsNow
-                        )
-                        if (
-                            window !== null &&
-                            window !== undefined
-                        ) {
-                            root.requestAppIcon(
-                                String(
-                                    window.app_id || ""
-                                )
-                            )
-                        }
-                    }
-
-                    // Window positions/layout changed inside Niri.
-                    //
-                    // This is separate from WindowOpenedOrChanged:
-                    // moving columns left/right may only update layout.
-                    if (event.WindowLayoutsChanged) {
-                        const payload =
-                            event.WindowLayoutsChanged
-
-                        const changes =
-                            payload.changes ||
-                            payload.layouts ||
-                            payload.windows ||
-                            payload
-
-                        let list =
-                            root.niriWindows.slice()
-
-                        function applyLayout(
-                            windowId,
-                            layout
-                        ) {
-                            for (
-                                let i = 0;
-                                i < list.length;
-                                i++
-                            ) {
-                                if (
-                                    String(list[i].id) !==
-                                    String(windowId)
-                                ) {
-                                    continue
-                                }
-
-                                const updated =
-                                    Object.assign(
-                                        {},
-                                        list[i]
-                                    )
-
-                                updated.layout =
-                                    layout
-
-                                list[i] =
-                                    updated
-
-                                return
-                            }
-                        }
-
-                        if (
-                            Array.isArray(changes)
-                        ) {
-                            for (
-                                let i = 0;
-                                i < changes.length;
-                                i++
-                            ) {
-                                const item =
-                                    changes[i]
-
-                                if (
-                                    item === null ||
-                                    item === undefined
-                                ) {
-                                    continue
-                                }
-
-                                if (
-                                    item.id !== undefined &&
-                                    item.layout !== undefined
-                                ) {
-                                    applyLayout(
-                                        item.id,
-                                        item.layout
-                                    )
-                                    continue
-                                }
-
-                                if (
-                                    Array.isArray(item) &&
-                                    item.length >= 2
-                                ) {
-                                    applyLayout(
-                                        item[0],
-                                        item[1]
-                                    )
-                                }
-                            }
-
-                        } else if (
-                            changes !== null &&
-                            typeof changes === "object"
-                        ) {
-                            for (
-                                const id in changes
-                            ) {
-                                const value =
-                                    changes[id]
-
-                                if (
-                                    value &&
-                                    value.layout !== undefined
-                                ) {
-                                    applyLayout(
-                                        id,
-                                        value.layout
-                                    )
-                                } else {
-                                    applyLayout(
-                                        id,
-                                        value
-                                    )
-                                }
-                            }
-                        }
-
-                        // Important:
-                        // assign a NEW array so QML bindings such as
-                        // workspaceApps are reevaluated immediately.
-                        root.niriWindows =
-                            list
-                    }
-
-                    // Closed window.
-                    if (event.WindowClosed) {
-                        const id =
-                            String(
-                                event.WindowClosed.id
-                            )
-
-                        root.removeNiriWindow(
-                            event.WindowClosed.id
-                        )
-
-                        let terminalCache =
-                            Object.assign(
-                                {},
-                                root.terminalAppCache
-                            )
-
-                        delete terminalCache[id]
-
-                        root.terminalAppCache =
-                            terminalCache
-
-                        let ready =
-                            Object.assign(
-                                {},
-                                root.terminalAppReady
-                            )
-
-                        delete ready[id]
-
-                        root.terminalAppReady =
-                            ready
-
-                        let firstSeen =
-                            Object.assign(
-                                {},
-                                root.windowFirstSeen
-                            )
-
-                        delete firstSeen[id]
-
-                        root.windowFirstSeen =
-                            firstSeen
-                    }
-
-                } catch (error) {
-                    console.log("Niri event parse error:", error)
                 }
+
+                Qt.callLater(root.scanTerminalAppsNow)
+                return
+            }
+
+            if (reason === "window-closed") {
+                const windowId =
+                    String(data.windowId || "")
+                let cache =
+                    Object.assign(
+                        {},
+                        root.terminalAppCache
+                    )
+                let ready =
+                    Object.assign(
+                        {},
+                        root.terminalAppReady
+                    )
+                let firstSeen =
+                    Object.assign(
+                        {},
+                        root.windowFirstSeen
+                    )
+
+                delete cache[windowId]
+                delete ready[windowId]
+                delete firstSeen[windowId]
+
+                root.terminalAppCache = cache
+                root.terminalAppReady = ready
+                root.windowFirstSeen = firstSeen
             }
         }
-    }
-
-    Process {
-        id: workspaceSwitch
-    }
-
-    Process {
-        id: keyboardLayoutSwitch
     }
 
     // =========================
@@ -2715,18 +2478,6 @@ PanelWindow {
                                 width: 18
                                 height: 22
 
-                                Component.onCompleted: {
-                                    root.requestAppIcon(
-                                        appIconItem.appId
-                                    )
-                                }
-
-                                onAppIdChanged: {
-                                    root.requestAppIcon(
-                                        appIconItem.appId
-                                    )
-                                }
-
                                 IconImage {
                                     anchors.centerIn: parent
 
@@ -2791,17 +2542,13 @@ PanelWindow {
                             Qt.PointingHandCursor
 
                         onClicked: {
-                            workspaceSwitch.command = [
-                                "niri",
-                                "msg",
-                                "action",
-                                "focus-workspace",
-                                String(
+                            redCoreService.sendCommand({
+                                "module": "workspaces",
+                                "action": "focus-workspace",
+                                "workspaceIndex": Number(
                                     workspaceItem.modelData.idx
                                 )
-                            ]
-
-                            workspaceSwitch.running = true
+                            })
                         }
                     }
                 }
@@ -2910,20 +2657,10 @@ PanelWindow {
                     cursorShape: Qt.PointingHandCursor
 
                     onClicked: {
-                        if (
-                            !keyboardLayoutSwitch.running
-                        ) {
-                            keyboardLayoutSwitch.command = [
-                                "niri",
-                                "msg",
-                                "action",
-                                "switch-layout",
-                                "next"
-                            ]
-
-                            keyboardLayoutSwitch.running =
-                                true
-                        }
+                        redCoreService.sendCommand({
+                            "module": "workspaces",
+                            "action": "switch-layout"
+                        })
                     }
                 }
             }

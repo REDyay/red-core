@@ -1,6 +1,7 @@
 mod battery;
 mod brightness;
 mod system_monitor;
+mod workspaces;
 
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -197,6 +198,10 @@ pub(crate) struct DaemonCommand {
     pub(crate) percentage: Option<u8>,
     pub(crate) max_value: Option<u32>,
     pub(crate) delta: Option<i16>,
+    pub(crate) workspace_index: Option<i64>,
+    pub(crate) app_id: Option<String>,
+    pub(crate) icon_name: Option<String>,
+    pub(crate) windows: Option<Vec<serde_json::Value>>,
 }
 
 #[derive(Serialize)]
@@ -477,6 +482,10 @@ fn is_brightness_command(command: &DaemonCommand) -> bool {
         )
 }
 
+fn is_workspaces_command(command: &DaemonCommand) -> bool {
+    command.module.as_deref() == Some("workspaces")
+}
+
 async fn run_command_loop(
     mut bluetooth: Option<BluetoothSimulator>,
     mut battery: Option<battery::BatterySimulator>,
@@ -499,6 +508,11 @@ async fn run_command_loop(
         };
 
         let action = command.action.clone();
+
+        if is_workspaces_command(&command) {
+            workspaces::apply_command(&command).await;
+            continue;
+        }
 
         if is_brightness_command(&command) {
             let is_preview = action == "preview-brightness";
@@ -716,6 +730,7 @@ async fn main() {
     }
 
     tokio::spawn(system_monitor::run_monitor());
+    tokio::spawn(workspaces::run_monitor());
 
     if let Err(error) =
         run_command_loop(bluetooth_simulator, battery_simulator, brightness_simulator).await
@@ -751,6 +766,10 @@ mod tests {
             percentage: None,
             max_value: None,
             delta: None,
+            workspace_index: None,
+            app_id: None,
+            icon_name: None,
+            windows: None,
         }
     }
 
@@ -768,6 +787,10 @@ mod tests {
             percentage: None,
             max_value: None,
             delta: None,
+            workspace_index: None,
+            app_id: None,
+            icon_name: None,
+            windows: None,
         }
     }
 

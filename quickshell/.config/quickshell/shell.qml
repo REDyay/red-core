@@ -825,17 +825,26 @@ PanelWindow {
         return root.currentPlaybackMode()
     }
 
-    property int cpuUsage: 0
-    property var cpuTemp: null
-    property int ramUsage: 0
+    readonly property int cpuUsage:
+        redCoreService.systemMonitorCpuUsage
+    readonly property var cpuTemp:
+        redCoreService.systemMonitorCpuTemp
+    readonly property int ramUsage:
+        redCoreService.systemMonitorRamUsage
 
-    property var gpuUsage: null
-    property string gpuVendor: "unknown"
+    readonly property var gpuUsage:
+        redCoreService.systemMonitorGpuUsage
+    readonly property string gpuVendor:
+        redCoreService.systemMonitorGpuVendor
 
-    property string networkType: "none"
-    property string networkInterface: ""
-    property int downloadSpeed: 0
-    property int uploadSpeed: 0
+    readonly property string networkType:
+        redCoreService.systemMonitorNetworkType
+    readonly property string networkInterface:
+        redCoreService.systemMonitorNetworkInterface
+    readonly property int downloadSpeed:
+        redCoreService.systemMonitorDownloadSpeed
+    readonly property int uploadSpeed:
+        redCoreService.systemMonitorUploadSpeed
 
     function formatSpeed(bytes) {
         if (bytes >= 1024 * 1024)
@@ -2195,87 +2204,6 @@ PanelWindow {
 
     Process {
         id: keyboardLayoutSwitch
-    }
-
-    // =========================
-    // SYSTEM INFO
-    // =========================
-
-    // One persistent monitor process.
-    // Hardware detection happens once in the backend,
-    // then real measurements are streamed every second.
-    Process {
-        id: systemInfoProcess
-
-        running: true
-
-        command: [
-            "redcore-system-monitor"
-        ]
-
-        stdout: SplitParser {
-            onRead: line => {
-                try {
-                    const data =
-                        JSON.parse(line)
-
-                    root.cpuUsage =
-                        data.cpu
-
-                    root.cpuTemp =
-                        data.cpuTemp
-
-                    root.ramUsage =
-                        data.ram
-
-                    root.gpuUsage =
-                        data.gpuUsage
-
-                    root.gpuVendor =
-                        data.gpuVendor
-
-                    root.networkInterface =
-                        data.network.interface
-
-                    root.networkType =
-                        data.network.type
-
-                    root.downloadSpeed =
-                        data.network.download
-
-                    root.uploadSpeed =
-                        data.network.upload
-
-                } catch (error) {
-                    console.log(
-                        "System monitor parse error:",
-                        error
-                    )
-                }
-            }
-        }
-
-        // If the backend crashes unexpectedly,
-        // retry once after a short delay.
-        onRunningChanged: {
-            if (!running) {
-                systemMonitorRestart.restart()
-            }
-        }
-    }
-
-    Timer {
-        id: systemMonitorRestart
-
-        interval: 2000
-        repeat: false
-
-        onTriggered: {
-            if (!systemInfoProcess.running) {
-                systemInfoProcess.running =
-                    true
-            }
-        }
     }
 
     // =========================

@@ -1,5 +1,6 @@
 mod battery;
 mod brightness;
+mod system_monitor;
 
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -662,6 +663,23 @@ async fn run_bluetooth_monitor() {
 #[tokio::main]
 async fn main() {
     let arguments: Vec<String> = env::args().skip(1).collect();
+
+    if arguments
+        .iter()
+        .any(|argument| argument == "--system-monitor-once")
+    {
+        system_monitor::run_legacy_stream(true).await;
+        return;
+    }
+
+    if arguments
+        .iter()
+        .any(|argument| argument == "--system-monitor")
+    {
+        system_monitor::run_legacy_stream(false).await;
+        return;
+    }
+
     let simulate_bluetooth = arguments
         .iter()
         .any(|argument| matches!(argument.as_str(), "--simulate" | "--simulate-bluetooth"));
@@ -696,6 +714,8 @@ async fn main() {
     } else {
         tokio::spawn(brightness::run_monitor());
     }
+
+    tokio::spawn(system_monitor::run_monitor());
 
     if let Err(error) =
         run_command_loop(bluetooth_simulator, battery_simulator, brightness_simulator).await

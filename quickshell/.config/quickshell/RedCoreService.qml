@@ -57,6 +57,19 @@ Item {
     property bool ddcutilAvailable: false
     property var brightnessDisplays: []
 
+    // System metrics share this one Rust process with the hardware modules.
+    property bool systemMonitorServiceAvailable: false
+    property int systemMonitorCpuUsage: 0
+    property var systemMonitorCpuTemp: null
+    property int systemMonitorRamUsage: 0
+    property string systemMonitorGpuName: "Unknown"
+    property string systemMonitorGpuVendor: "unknown"
+    property var systemMonitorGpuUsage: null
+    property string systemMonitorNetworkInterface: ""
+    property string systemMonitorNetworkType: "none"
+    property int systemMonitorDownloadSpeed: 0
+    property int systemMonitorUploadSpeed: 0
+
     readonly property string daemonLauncher:
         "daemon=\"${REDCORE_DAEMON:-}\"; " +
         "if [ -z \"$daemon\" ] && [ -x \"$HOME/.local/lib/red-core/redcore-daemon\" ]; then " +
@@ -217,6 +230,43 @@ Item {
             return
         }
 
+        if (event === "system-monitor-state") {
+            service.restartDelay = 1500
+            service.systemMonitorServiceAvailable =
+                data.serviceAvailable === true
+            service.systemMonitorCpuUsage =
+                Number(data.cpu || 0)
+            service.systemMonitorCpuTemp =
+                data.cpuTemp === null ||
+                data.cpuTemp === undefined
+                ? null
+                : Number(data.cpuTemp)
+            service.systemMonitorRamUsage =
+                Number(data.ram || 0)
+            service.systemMonitorGpuName =
+                String(data.gpuName || "Unknown")
+            service.systemMonitorGpuVendor =
+                String(data.gpuVendor || "unknown")
+            service.systemMonitorGpuUsage =
+                data.gpuUsage === null ||
+                data.gpuUsage === undefined
+                ? null
+                : Number(data.gpuUsage)
+
+            const network =
+                data.network || ({})
+
+            service.systemMonitorNetworkInterface =
+                String(network.interface || "")
+            service.systemMonitorNetworkType =
+                String(network.type || "none")
+            service.systemMonitorDownloadSpeed =
+                Number(network.download || 0)
+            service.systemMonitorUploadSpeed =
+                Number(network.upload || 0)
+            return
+        }
+
         if (event === "bluetooth-action-result") {
             service.bluetoothActionResult(data)
             return
@@ -277,6 +327,17 @@ Item {
             service.brightnessAvailable = false
             service.brightnessSimulated = false
             service.brightnessDisplays = []
+            service.systemMonitorServiceAvailable = false
+            service.systemMonitorCpuUsage = 0
+            service.systemMonitorCpuTemp = null
+            service.systemMonitorRamUsage = 0
+            service.systemMonitorGpuName = "Unknown"
+            service.systemMonitorGpuVendor = "unknown"
+            service.systemMonitorGpuUsage = null
+            service.systemMonitorNetworkInterface = ""
+            service.systemMonitorNetworkType = "none"
+            service.systemMonitorDownloadSpeed = 0
+            service.systemMonitorUploadSpeed = 0
 
             restartTimer.interval =
                 service.restartDelay

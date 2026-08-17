@@ -285,6 +285,15 @@ Item {
         )
     }
 
+    function secureWeatherCache() {
+        weatherPermissions.command = [
+            "chmod",
+            "600",
+            weatherCache.path
+        ]
+        weatherPermissions.running = true
+    }
+
 
     function weatherUrl() {
         const latitude = encodeURIComponent(
@@ -545,7 +554,21 @@ Item {
         watchChanges: false
         printErrors: false
 
-        onLoaded: dateWeather.restoreCache()
+        onLoaded: {
+            dateWeather.restoreCache()
+            dateWeather.secureWeatherCache()
+        }
+
+        onSaved: dateWeather.secureWeatherCache()
+    }
+
+
+    Process {
+        id: weatherPermissions
+
+        running: false
+        stdout: StdioCollector {}
+        stderr: StdioCollector {}
     }
 
 

@@ -1,15 +1,22 @@
 mod battery;
 mod brightness;
+mod media;
+mod network;
+mod power;
 mod system_monitor;
 mod workspaces;
 
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::env;
 use std::io::{self, Write};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::task::JoinHandle;
 use tokio::time::{MissedTickBehavior, interval, sleep};
+
+const DAEMON_PROTOCOL_VERSION: u32 = 5;
 
 const INITIAL_RETRY_DELAY: Duration = Duration::from_secs(2);
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(60);
@@ -61,6 +68,7 @@ impl BluetoothState {
         }
     }
 
+    #[cfg(test)]
     fn ready(adapters: Vec<BluetoothAdapter>) -> Self {
         Self {
             event: "bluetooth-state",
@@ -84,11 +92,54 @@ impl BluetoothState {
     }
 }
 
+fn bluetooth_device_kind(icon: Option<&str>, class: Option<u32>) -> String {
+    let icon = icon.unwrap_or_default().to_ascii_lowercase();
+
+    if icon.contains("headset") || icon.contains("headphone") {
+        "headphones"
+    } else if icon.contains("speaker") || icon.contains("audio-card") {
+        "speaker"
+    } else if icon.contains("keyboard") {
+        "keyboard"
+    } else if icon.contains("phone") {
+        "phone"
+    } else if class.is_some_and(|value| value >> 8 & 0x1f == 0x02) {
+        "phone"
+    } else {
+        "unknown"
+    }
+    .to_string()
+}
+
+async fn read_device(adapter: &bluer::Adapter, address: bluer::Address) -> Option<BluetoothDevice> {
+    let device = adapter.device(address).ok()?;
+    let name = device
+        .alias()
+        .await
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| address.to_string());
+    let icon = device.icon().await.ok().flatten();
+    let class = device.class().await.ok().flatten();
+
+    Some(BluetoothDevice {
+        adapter: adapter.name().to_string(),
+        address: address.to_string(),
+        name,
+        kind: bluetooth_device_kind(icon.as_deref(), class),
+        paired: device.is_paired().await.unwrap_or(false),
+        trusted: device.is_trusted().await.unwrap_or(false),
+        connected: device.is_connected().await.unwrap_or(false),
+        rssi: device.rssi().await.ok().flatten(),
+    })
+}
+
 async fn read_state(session: &bluer::Session) -> Result<BluetoothState, bluer::Error> {
     let mut adapter_names = session.adapter_names().await?;
     adapter_names.sort_unstable();
 
     let mut adapters = Vec::new();
+    let mut devices = Vec::new();
     let mut first_property_error = None;
 
     for name in adapter_names {
@@ -117,6 +168,16 @@ async fn read_state(session: &bluer::Session) -> Result<BluetoothState, bluer::E
         let alias = adapter.alias().await.unwrap_or_else(|_| name.clone());
         let discovering = adapter.is_discovering().await.unwrap_or(false);
 
+        if let Ok(mut addresses) = adapter.device_addresses().await {
+            addresses.sort_unstable();
+
+            for address in addresses {
+                if let Some(device) = read_device(&adapter, address).await {
+                    devices.push(device);
+                }
+            }
+        }
+
         adapters.push(BluetoothAdapter {
             name,
             alias,
@@ -131,7 +192,20 @@ async fn read_state(session: &bluer::Session) -> Result<BluetoothState, bluer::E
         return Err(error);
     }
 
-    Ok(BluetoothState::ready(adapters))
+    devices.sort_by(|left, right| {
+        left.adapter
+            .cmp(&right.adapter)
+            .then_with(|| left.address.cmp(&right.address))
+    });
+
+    Ok(BluetoothState {
+        event: "bluetooth-state",
+        service_available: true,
+        available: !adapters.is_empty(),
+        simulated: false,
+        adapters,
+        devices,
+    })
 }
 
 pub(crate) fn send_json<T: Serialize>(value: &T, description: &str) -> bool {
@@ -155,6 +229,23 @@ pub(crate) fn send_json<T: Serialize>(value: &T, description: &str) -> bool {
     }
 
     true
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DaemonReady {
+    event: &'static str,
+    protocol_version: u32,
+}
+
+fn send_daemon_ready() {
+    send_json(
+        &DaemonReady {
+            event: "daemon-ready",
+            protocol_version: DAEMON_PROTOCOL_VERSION,
+        },
+        "daemon readiness",
+    );
 }
 
 fn send_state(state: &BluetoothState) -> bool {
@@ -202,6 +293,17 @@ pub(crate) struct DaemonCommand {
     pub(crate) app_id: Option<String>,
     pub(crate) icon_name: Option<String>,
     pub(crate) windows: Option<Vec<serde_json::Value>>,
+    pub(crate) media: Option<media::MediaCommandPayload>,
+    pub(crate) request_id: Option<u64>,
+    pub(crate) device: Option<String>,
+    pub(crate) ssid: Option<String>,
+    pub(crate) password: Option<String>,
+    pub(crate) security_mode: Option<String>,
+    pub(crate) saved_uuid: Option<String>,
+    pub(crate) uuid: Option<String>,
+    pub(crate) hidden: Option<bool>,
+    pub(crate) autoconnect: Option<bool>,
+    pub(crate) autoconnect_priority: Option<i32>,
 }
 
 #[derive(Serialize)]
@@ -455,6 +557,175 @@ impl BluetoothSimulator {
     }
 }
 
+struct BluetoothController {
+    session: bluer::Session,
+    _agent: Option<bluer::agent::AgentHandle>,
+    discoveries: HashMap<String, JoinHandle<()>>,
+}
+
+impl BluetoothController {
+    async fn new() -> Result<Self, String> {
+        let session = bluer::Session::new()
+            .await
+            .map_err(|error| format!("Bluetooth service is unavailable: {error}"))?;
+        let agent = match session.register_agent(bluer::agent::Agent::default()).await {
+            Ok(agent) => Some(agent),
+            Err(error) => {
+                eprintln!("Bluetooth pairing agent is unavailable: {error}");
+                None
+            }
+        };
+
+        Ok(Self {
+            session,
+            _agent: agent,
+            discoveries: HashMap::new(),
+        })
+    }
+
+    async fn adapter(&self, name: Option<&str>) -> Result<bluer::Adapter, String> {
+        let name = name.ok_or_else(|| "Missing Bluetooth adapter".to_string())?;
+        let names = self
+            .session
+            .adapter_names()
+            .await
+            .map_err(|error| error.to_string())?;
+
+        if !names.iter().any(|available| available == name) {
+            return Err(format!("Bluetooth adapter {name} was not found"));
+        }
+
+        self.session
+            .adapter(name)
+            .map_err(|error| error.to_string())
+    }
+
+    fn stop_discovery(&mut self, adapter: &str) {
+        if let Some(task) = self.discoveries.remove(adapter) {
+            task.abort();
+        }
+    }
+
+    async fn start_discovery(&mut self, adapter: bluer::Adapter) -> Result<(), String> {
+        let name = adapter.name().to_string();
+        self.stop_discovery(&name);
+
+        if !adapter
+            .is_powered()
+            .await
+            .map_err(|error| error.to_string())?
+        {
+            return Err(format!("Bluetooth adapter {name} is powered off"));
+        }
+
+        let events = adapter
+            .discover_devices_with_changes()
+            .await
+            .map_err(|error| error.to_string())?;
+        let session = self.session.clone();
+        let task = tokio::spawn(async move {
+            futures_util::pin_mut!(events);
+
+            while events.next().await.is_some() {
+                sleep(Duration::from_millis(150)).await;
+
+                if let Ok(state) = read_state(&session).await {
+                    send_state(&state);
+                }
+            }
+        });
+        self.discoveries.insert(name, task);
+        Ok(())
+    }
+
+    async fn device(
+        &self,
+        adapter_name: Option<&str>,
+        address: Option<&str>,
+    ) -> Result<(bluer::Adapter, bluer::Device), String> {
+        let adapter = self.adapter(adapter_name).await?;
+        let address = address
+            .ok_or_else(|| "Missing Bluetooth device address".to_string())?
+            .parse::<bluer::Address>()
+            .map_err(|_| "Invalid Bluetooth device address".to_string())?;
+        let device = adapter.device(address).map_err(|error| error.to_string())?;
+        Ok((adapter, device))
+    }
+
+    async fn apply(&mut self, command: &DaemonCommand) -> Result<(), String> {
+        match command.action.as_str() {
+            "get-state" => {}
+            "set-powered" => {
+                let adapter = self.adapter(command.adapter.as_deref()).await?;
+                let powered = command
+                    .powered
+                    .ok_or_else(|| "Missing powered value".to_string())?;
+
+                if !powered {
+                    self.stop_discovery(adapter.name());
+                }
+                adapter
+                    .set_powered(powered)
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
+            "scan" => {
+                let adapter = self.adapter(command.adapter.as_deref()).await?;
+                let enabled = command
+                    .enabled
+                    .ok_or_else(|| "Missing enabled value".to_string())?;
+
+                if enabled {
+                    self.start_discovery(adapter).await?;
+                } else {
+                    self.stop_discovery(adapter.name());
+                }
+            }
+            "pair" => {
+                let (_, device) = self
+                    .device(command.adapter.as_deref(), command.address.as_deref())
+                    .await?;
+                device.pair().await.map_err(|error| error.to_string())?;
+                device
+                    .set_trusted(true)
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
+            "connect" => {
+                let (_, device) = self
+                    .device(command.adapter.as_deref(), command.address.as_deref())
+                    .await?;
+                device.connect().await.map_err(|error| error.to_string())?;
+            }
+            "disconnect" => {
+                let (_, device) = self
+                    .device(command.adapter.as_deref(), command.address.as_deref())
+                    .await?;
+                device
+                    .disconnect()
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
+            "forget" => {
+                let (adapter, device) = self
+                    .device(command.adapter.as_deref(), command.address.as_deref())
+                    .await?;
+                adapter
+                    .remove_device(device.address())
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
+            _ => return Err(format!("Unknown Bluetooth action: {}", command.action)),
+        }
+
+        let state = read_state(&self.session)
+            .await
+            .map_err(|error| error.to_string())?;
+        send_state(&state);
+        Ok(())
+    }
+}
+
 fn is_battery_command(command: &DaemonCommand) -> bool {
     command.module.as_deref() == Some("battery")
         || matches!(
@@ -486,10 +757,28 @@ fn is_workspaces_command(command: &DaemonCommand) -> bool {
     command.module.as_deref() == Some("workspaces")
 }
 
+fn is_media_command(command: &DaemonCommand) -> bool {
+    command.module.as_deref() == Some("media")
+}
+
+fn is_network_command(command: &DaemonCommand) -> bool {
+    command.module.as_deref() == Some("network")
+}
+
+fn is_power_command(command: &DaemonCommand) -> bool {
+    command.module.as_deref() == Some("power")
+}
+
+fn is_network_state_request(command: &DaemonCommand) -> bool {
+    matches!(command.action.as_str(), "get-state" | "snapshot")
+}
+
 async fn run_command_loop(
     mut bluetooth: Option<BluetoothSimulator>,
+    mut bluetooth_controller: Option<BluetoothController>,
     mut battery: Option<battery::BatterySimulator>,
     mut brightness: Option<brightness::BrightnessSimulator>,
+    mut network: Option<network::NetworkSimulator>,
 ) -> Result<(), String> {
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
 
@@ -509,8 +798,50 @@ async fn run_command_loop(
 
         let action = command.action.clone();
 
+        if is_power_command(&command) {
+            let state_request = action == "get-state";
+            let result = power::apply_command(&command).await;
+
+            if !state_request {
+                power::send_action_result(&command, result);
+            }
+
+            continue;
+        }
+
+        if is_network_command(&command) {
+            let state_request = is_network_state_request(&command);
+
+            if let Some(simulator) = &mut network {
+                match simulator.apply(&command) {
+                    Ok(message) => {
+                        if !state_request {
+                            network::send_action_result(&command, Ok(message));
+                        }
+                        simulator.send_state();
+                    }
+                    Err(error) => {
+                        if !state_request {
+                            network::send_action_result(&command, Err(error));
+                        }
+                    }
+                }
+            } else {
+                let result = network::apply_command(&command).await;
+                if !state_request {
+                    network::send_action_result(&command, result);
+                }
+            }
+            continue;
+        }
+
         if is_workspaces_command(&command) {
             workspaces::apply_command(&command).await;
+            continue;
+        }
+
+        if is_media_command(&command) {
+            media::apply_command(&command);
             continue;
         }
 
@@ -592,10 +923,22 @@ async fn run_command_loop(
                 Err(message) => send_bluetooth_action_result(&action, Err(&message)),
             }
         } else {
-            send_bluetooth_action_result(
-                &action,
-                Err("Real Bluetooth actions are not implemented yet"),
-            );
+            if bluetooth_controller.is_none() {
+                match BluetoothController::new().await {
+                    Ok(controller) => bluetooth_controller = Some(controller),
+                    Err(message) => {
+                        send_bluetooth_action_result(&action, Err(&message));
+                        continue;
+                    }
+                }
+            }
+
+            if let Some(controller) = &mut bluetooth_controller {
+                match controller.apply(&command).await {
+                    Ok(()) => send_bluetooth_action_result(&action, Ok(())),
+                    Err(message) => send_bluetooth_action_result(&action, Err(&message)),
+                }
+            }
         }
     }
 
@@ -694,6 +1037,17 @@ async fn main() {
         return;
     }
 
+    if let Some(index) = arguments
+        .iter()
+        .position(|argument| argument == "--local-media")
+    {
+        if let Err(error) = media::run_cli(&arguments[index + 1..]) {
+            eprintln!("Red Core Local Media: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
     let simulate_bluetooth = arguments
         .iter()
         .any(|argument| matches!(argument.as_str(), "--simulate" | "--simulate-bluetooth"));
@@ -703,10 +1057,16 @@ async fn main() {
     let simulate_brightness = arguments
         .iter()
         .any(|argument| argument == "--simulate-brightness");
+    let simulate_network = arguments
+        .iter()
+        .any(|argument| argument == "--simulate-network");
 
     let bluetooth_simulator = simulate_bluetooth.then(BluetoothSimulator::new);
     let battery_simulator = simulate_battery.then(battery::BatterySimulator::new);
     let brightness_simulator = simulate_brightness.then(brightness::BrightnessSimulator::new);
+    let network_simulator = simulate_network.then(network::NetworkSimulator::new);
+
+    send_daemon_ready();
 
     if let Some(simulator) = &bluetooth_simulator {
         eprintln!("Bluetooth simulation is active");
@@ -729,11 +1089,26 @@ async fn main() {
         tokio::spawn(brightness::run_monitor());
     }
 
+    if let Some(simulator) = &network_simulator {
+        eprintln!("Network simulation is active");
+        simulator.send_state();
+    } else {
+        tokio::spawn(network::run_monitor());
+    }
+
     tokio::spawn(system_monitor::run_monitor());
     tokio::spawn(workspaces::run_monitor());
+    media::send_state();
+    power::send_state().await;
 
-    if let Err(error) =
-        run_command_loop(bluetooth_simulator, battery_simulator, brightness_simulator).await
+    if let Err(error) = run_command_loop(
+        bluetooth_simulator,
+        None,
+        battery_simulator,
+        brightness_simulator,
+        network_simulator,
+    )
+    .await
     {
         eprintln!("Red Core command service stopped: {error}");
     }
@@ -770,6 +1145,17 @@ mod tests {
             app_id: None,
             icon_name: None,
             windows: None,
+            media: None,
+            request_id: None,
+            device: None,
+            ssid: None,
+            password: None,
+            security_mode: None,
+            saved_uuid: None,
+            uuid: None,
+            hidden: None,
+            autoconnect: None,
+            autoconnect_priority: None,
         }
     }
 
@@ -791,6 +1177,17 @@ mod tests {
             app_id: None,
             icon_name: None,
             windows: None,
+            media: None,
+            request_id: None,
+            device: None,
+            ssid: None,
+            password: None,
+            security_mode: None,
+            saved_uuid: None,
+            uuid: None,
+            hidden: None,
+            autoconnect: None,
+            autoconnect_priority: None,
         }
     }
 
@@ -803,6 +1200,16 @@ mod tests {
         assert!(!state.simulated);
         assert!(state.adapters.is_empty());
         assert!(state.devices.is_empty());
+    }
+
+    #[test]
+    fn network_snapshot_is_not_an_action_result() {
+        let mut request = command("snapshot");
+        request.module = Some("network".to_string());
+
+        assert!(is_network_state_request(&request));
+        request.action = "wifi".to_string();
+        assert!(!is_network_state_request(&request));
     }
 
     #[test]

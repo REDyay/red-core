@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use tokio::time::{MissedTickBehavior, interval};
 
 const REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+const DDC_REDETECT_INTERVAL: Duration = Duration::from_secs(10 * 60);
 const MINIMUM_PERCENTAGE: u8 = 1;
 const BRIGHTNESSCTL_TIMEOUT: Duration = Duration::from_secs(5);
 const DDCUTIL_TIMEOUT: Duration = Duration::from_secs(12);
@@ -426,7 +427,7 @@ async fn read_brightnessctl() -> (bool, Vec<BrightnessDisplay>) {
     }
 }
 
-async fn read_ddcutil() -> (bool, Vec<BrightnessDisplay>) {
+async fn detect_ddcutil() -> (bool, Vec<DdcDisplay>) {
     let detect = run_command(
         "ddcutil",
         vec![
@@ -446,7 +447,13 @@ async fn read_ddcutil() -> (bool, Vec<BrightnessDisplay>) {
         }
     };
 
-    let detected = parse_ddc_detect(&String::from_utf8_lossy(&detect.stdout));
+    (
+        true,
+        parse_ddc_detect(&String::from_utf8_lossy(&detect.stdout)),
+    )
+}
+
+async fn read_detected_ddc(detected: Vec<DdcDisplay>) -> Vec<BrightnessDisplay> {
     let mut displays = Vec::new();
 
     for display in detected {
@@ -489,7 +496,17 @@ async fn read_ddcutil() -> (bool, Vec<BrightnessDisplay>) {
         });
     }
 
-    (true, displays)
+    displays
+}
+
+async fn read_ddcutil() -> (bool, Vec<BrightnessDisplay>) {
+    let (available, detected) = detect_ddcutil().await;
+
+    if !available {
+        return (false, Vec::new());
+    }
+
+    (true, read_detected_ddc(detected).await)
 }
 
 pub(crate) async fn read_real_state() -> BrightnessState {
@@ -641,11 +658,28 @@ pub(crate) async fn send_real_state() {
 pub(crate) async fn run_monitor() {
     let mut last_state = None;
     let mut refresh = interval(REFRESH_INTERVAL);
+    let mut ddcutil_available = false;
+    let mut detected_ddc = Vec::new();
+    let mut next_ddc_detection = Instant::now();
     refresh.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
     loop {
         refresh.tick().await;
-        send_if_changed(&mut last_state, read_real_state().await);
+
+        if Instant::now() >= next_ddc_detection {
+            (ddcutil_available, detected_ddc) = detect_ddcutil().await;
+            next_ddc_detection = Instant::now() + DDC_REDETECT_INTERVAL;
+        }
+
+        let ((brightnessctl_available, mut displays), external) = tokio::join!(
+            read_brightnessctl(),
+            read_detected_ddc(detected_ddc.clone())
+        );
+        displays.extend(external);
+        send_if_changed(
+            &mut last_state,
+            BrightnessState::real(brightnessctl_available, ddcutil_available, displays),
+        );
     }
 }
 
@@ -771,6 +805,17 @@ mod tests {
             app_id: None,
             icon_name: None,
             windows: None,
+            media: None,
+            request_id: None,
+            device: None,
+            ssid: None,
+            password: None,
+            security_mode: None,
+            saved_uuid: None,
+            uuid: None,
+            hidden: None,
+            autoconnect: None,
+            autoconnect_priority: None,
         }
     }
 

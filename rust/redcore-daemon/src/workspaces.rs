@@ -6,13 +6,41 @@ use std::env;
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 use tokio::time::sleep;
 
 const INITIAL_RETRY_DELAY: Duration = Duration::from_secs(2);
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(60);
+
+struct ManagedChild(Option<Child>);
+
+impl ManagedChild {
+    fn new(child: Child) -> Self {
+        Self(Some(child))
+    }
+
+    fn child_mut(&mut self) -> &mut Child {
+        self.0.as_mut().expect("managed child should exist")
+    }
+
+    fn wait(mut self) -> std::io::Result<ExitStatus> {
+        self.0
+            .take()
+            .expect("managed child should exist")
+            .wait()
+    }
+}
+
+impl Drop for ManagedChild {
+    fn drop(&mut self) {
+        if let Some(child) = &mut self.0 {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -301,13 +329,13 @@ fn monitor_session() -> (String, bool) {
         .spawn();
 
     let mut child = match child {
-        Ok(child) => child,
+        Ok(child) => ManagedChild::new(child),
         Err(error) => {
             return (format!("could not start Niri event stream: {error}"), false);
         }
     };
 
-    let Some(stdout) = child.stdout.take() else {
+    let Some(stdout) = child.child_mut().stdout.take() else {
         return ("Niri event stream has no stdout".to_string(), false);
     };
     let lines = BufReader::new(stdout).lines();
@@ -650,15 +678,21 @@ fn find_named_icon(index: &DesktopIndex, app_id: &str, requested_icon: &str) -> 
         }
     }
 
+    let mut visited_directories = HashSet::new();
     for directory in &index.icon_dirs {
         let mut stack = vec![directory.clone()];
         while let Some(current) = stack.pop() {
+            let identity = current.canonicalize().unwrap_or_else(|_| current.clone());
+            if !visited_directories.insert(identity) {
+                continue;
+            }
+
             let Ok(children) = fs::read_dir(current) else {
                 continue;
             };
             for child in children.flatten() {
                 let path = child.path();
-                if path.is_dir() {
+                if child.file_type().is_ok_and(|kind| kind.is_dir()) {
                     stack.push(path);
                 } else if path
                     .file_name()

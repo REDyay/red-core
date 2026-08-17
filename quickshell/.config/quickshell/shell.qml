@@ -2,7 +2,6 @@ import Quickshell
 import Quickshell.Io
 import Quickshell.Widgets
 import Quickshell.Services.Mpris
-import Quickshell.Services.Pipewire
 import QtQuick
 
 PanelWindow {
@@ -34,7 +33,8 @@ PanelWindow {
     // Normally Red Core must never steal keyboard focus.
     // Enable it only while an interactive popup needs typing.
     focusable:
-        networkModule.keyboardInputActive
+        networkModule.keyboardInputActive ||
+        dateWeatherModule.keyboardInputActive
 
     readonly property var workspaces:
         redCoreService.workspaces
@@ -680,10 +680,6 @@ PanelWindow {
     // Empty = automatic player selection.
     property string pinnedPlayerDbusName: ""
 
-    // If a state write is already running, remember that
-    // another save is needed instead of losing the update.
-    property bool localStateSavePending: false
-
     // Used to detect the actual Paused -> Playing transition.
     property var playerPlayingSnapshot: ({})
 
@@ -692,10 +688,75 @@ PanelWindow {
     property string mediaTransitionDbusName: ""
     property double mediaTransitionUntil: 0
 
-    // Local queue information.
-    property int localQueueCount: 0
-    property string localQueueCurrent: ""
-    property string localQueueNext: ""
+    function applyLocalMediaState(data) {
+        root.lastLocalUri =
+            String(data.uri || "")
+        root.lastLocalTitle =
+            String(data.title || "")
+        root.lastLocalArtist =
+            String(data.artist || "")
+        root.lastLocalArt =
+            String(data.art || "")
+        root.lastLocalPosition =
+            Math.max(0, Number(data.position || 0))
+
+        const mode =
+            String(data.mode || "normal")
+
+        if (
+            mode === "normal" ||
+            mode === "track" ||
+            mode === "playlist" ||
+            mode === "shuffle"
+        ) {
+            root.localPlaybackMode = mode
+
+            if (root.lastLocalUri !== "") {
+                Qt.callLater(
+                    root.saveLocalMediaState
+                )
+            }
+        }
+
+        // Display remembered Local Music without starting it.
+        // A live MPRIS source always remains authoritative.
+        if (
+            root.activePlayer === null &&
+            root.lastLocalUri !== ""
+        ) {
+            root.lastMediaUri = root.lastLocalUri
+            root.lastMediaTitle = root.lastLocalTitle
+            root.lastMediaArtist = root.lastLocalArtist
+            root.lastMediaArt = root.lastLocalArt
+        }
+    }
+
+    Connections {
+        target: redCoreService
+
+        function onRunningChanged() {
+            if (redCoreService.running) {
+                redCoreService.sendCommand({
+                    "module": "media",
+                    "action": "get-local-state"
+                })
+            }
+        }
+
+        function onMediaLocalState(data) {
+            root.applyLocalMediaState(data)
+        }
+
+        function onMediaActionResult(data) {
+            if (data.success !== true) {
+                console.warn(
+                    "Red Core Media action failed:",
+                    String(data.action || "unknown"),
+                    String(data.message || "")
+                )
+            }
+        }
+    }
 
     function currentPlaybackMode() {
         const player = root.activePlayer
@@ -901,9 +962,21 @@ PanelWindow {
     }
 
     function playerIsLocal(player) {
+        if (
+            player === null ||
+            player === undefined
+        ) {
+            return false
+        }
+
         const uri = root.playerUri(player)
+        const dbusName =
+            String(player.dbusName || "")
 
         return (
+            dbusName.startsWith(
+                "org.mpris.MediaPlayer2.mpv"
+            ) &&
             uri !== "" &&
             uri.startsWith("file://")
         )
@@ -1016,8 +1089,9 @@ PanelWindow {
         const players = Mpris.players.values
         let sources = []
 
-        // All file:// MPRIS players represent ONE logical
-        // Red Core Local Music source.
+        // Red Core's mpv-mpris file:// session represents one
+        // logical Local Music source. Other local-file
+        // players such as VLC remain independent sources.
         const local =
             root.bestLocalPlayer()
 
@@ -1080,8 +1154,9 @@ PanelWindow {
         if (uri !== "")
             root.lastMediaUri = uri
 
-        // Online players must NEVER overwrite Local Music.
-        if (uri.startsWith("file://")) {
+        // Other MPRIS players must NEVER overwrite
+        // Red Core Local Music, even when they play a file.
+        if (root.playerIsLocal(player)) {
             const trackChanged =
                 uri !== root.lastLocalUri
 
@@ -1146,16 +1221,15 @@ PanelWindow {
 
         root.pinnedPlayerDbusName = ""
 
-        if (!resumeLocalMedia.running) {
-            resumeLocalMedia.command = [
-                "redcore-local-media",
-                root.lastLocalUri,
-                root.localPlaybackMode,
-                String(root.lastLocalPosition)
-            ]
-
-            resumeLocalMedia.running = true
-        }
+        redCoreService.sendCommand({
+            "module": "media",
+            "action": "start-local-media",
+            "media": {
+                "uri": root.lastLocalUri,
+                "mode": root.localPlaybackMode,
+                "position": root.lastLocalPosition
+            }
+        })
     }
 
     function toggleOrResumeMedia() {
@@ -1528,116 +1602,18 @@ PanelWindow {
             return
         }
 
-        if (localStateSave.running) {
-            root.localStateSavePending = true
-            return
-        }
-
-        localStateSave.command = [
-            "redcore-media-state",
-            "save",
-            root.lastLocalUri,
-            root.lastLocalTitle,
-            root.lastLocalArtist,
-            root.lastLocalArt,
-            String(root.lastLocalPosition),
-            root.localPlaybackMode
-        ]
-
-        localStateSave.running = true
-    }
-
-    Process {
-        id: resumeLocalMedia
-    }
-
-    // Load Local Music state once when Quickshell starts.
-    Process {
-        id: localStateLoad
-
-        running: true
-        command: [
-            "redcore-media-state",
-            "get"
-        ]
-
-        stdout: StdioCollector {
-            onStreamFinished: {
-                try {
-                    const data =
-                        JSON.parse(this.text)
-
-                    root.lastLocalUri =
-                        data.uri || ""
-
-                    root.lastLocalTitle =
-                        data.title || ""
-
-                    root.lastLocalArtist =
-                        data.artist || ""
-
-                    root.lastLocalArt =
-                        data.art || ""
-
-                    root.lastLocalPosition =
-                        Number(data.position || 0)
-
-                    const mode =
-                        data.mode || "normal"
-
-                    if (
-                        mode === "normal" ||
-                        mode === "track" ||
-                        mode === "playlist" ||
-                        mode === "shuffle"
-                    ) {
-                        root.localPlaybackMode =
-                            mode
-                    }
-
-                    // Display remembered local music
-                    // without automatically starting it.
-                    if (
-                        root.activePlayer === null &&
-                        root.lastLocalUri !== ""
-                    ) {
-                        root.lastMediaUri =
-                            root.lastLocalUri
-
-                        root.lastMediaTitle =
-                            root.lastLocalTitle
-
-                        root.lastMediaArtist =
-                            root.lastLocalArtist
-
-                        root.lastMediaArt =
-                            root.lastLocalArt
-                    }
-                } catch (error) {
-                    console.log(
-                        "Could not load Local Media state:",
-                        error
-                    )
-                }
+        redCoreService.sendCommand({
+            "module": "media",
+            "action": "save-local-state",
+            "media": {
+                "uri": root.lastLocalUri,
+                "title": root.lastLocalTitle,
+                "artist": root.lastLocalArtist,
+                "art": root.lastLocalArt,
+                "position": root.lastLocalPosition,
+                "mode": root.localPlaybackMode
             }
-        }
-    }
-
-    Process {
-        id: localStateSave
-
-        onExited: {
-            if (
-                root.localStateSavePending
-            ) {
-                root.localStateSavePending =
-                    false
-
-                Qt.callLater(
-                    root.saveLocalMediaState
-                )
-            }
-        }
+        })
     }
 
 
@@ -1969,16 +1945,6 @@ PanelWindow {
         }
     }
 
-    // =========================
-    // PIPEWIRE AUDIO
-    // =========================
-
-    PwObjectTracker {
-        objects: [Pipewire.defaultAudioSink]
-    }
-
-    property var audioSink: Pipewire.defaultAudioSink
-
     // NetworkManager state.
 
     // Nearby Wi-Fi networks.
@@ -1986,43 +1952,6 @@ PanelWindow {
 
     // Wi-Fi connection UI.
 
-
-
-
-
-    function changeVolume(delta) {
-        if (
-            root.audioSink === null ||
-            root.audioSink.audio === null
-        )
-            return
-
-        let value = root.audioSink.audio.volume + delta
-
-        if (value < 0)
-            value = 0
-
-        if (value > 1)
-            value = 1
-
-        root.audioSink.audio.volume = value
-
-        if (
-            root.audioSink.audio.muted &&
-            value > 0
-        ) {
-            root.audioSink.audio.muted = false
-        }
-    }
-
-    // =========================
-    // CLOCK
-    // =========================
-
-    SystemClock {
-        id: clock
-        precision: SystemClock.Minutes
-    }
 
     // =========================
     // MAIN BAR
@@ -2182,8 +2111,9 @@ PanelWindow {
                                 root.activePlayer !== null ||
                                 root.lastMediaTitle !== ""
                             ) {
-                                mediaPopup.visible =
-                                    !mediaPopup.visible
+                                redCoreService.togglePopup(
+                                    "media"
+                                )
                             }
                         }
                     }
@@ -2349,7 +2279,9 @@ PanelWindow {
                                     return
                                 }
 
-                                const opening = !mediaPopup.visible
+                                const opening =
+                                    redCoreService.activePopup !==
+                                        "media"
 
                                 if (
                                     opening &&
@@ -2359,7 +2291,9 @@ PanelWindow {
                                     root.activePlayer.positionChanged()
                                 }
 
-                                mediaPopup.visible = opening
+                                redCoreService.togglePopup(
+                                    "media"
+                                )
                             }
                         }
                     }
@@ -2573,63 +2507,17 @@ PanelWindow {
             // ---------------------
             // Alerts
             // ---------------------
-            Rectangle {
-                width: 32
-                height: 32
-                radius: 10
-                color: "#313244"
-
-                Text {
-                    anchors.centerIn: parent
-                    text: "!"
-                    color: "#cdd6f4"
-                    font.pixelSize: 13
-                    font.bold: true
-                }
+            NotificationModule {
+                id: notificationModule
+                service: redCoreService
             }
 
             // ---------------------
             // Audio
             // ---------------------
-            Rectangle {
-                width: 64
-                height: 32
-                radius: 10
-                color: "#313244"
-
-                Text {
-                    anchors.centerIn: parent
-
-                    text:
-                        root.audioSink !== null &&
-                        root.audioSink.audio !== null
-                        ? (
-                            root.audioSink.audio.muted
-                            ? "Muted"
-                            : Math.round(
-                                root.audioSink.audio.volume * 100
-                              ) + "%"
-                          )
-                        : "--%"
-
-                    color: "#cdd6f4"
-                    font.pixelSize: 13
-                }
-
-                MouseArea {
-                    anchors.fill: parent
-                    cursorShape: Qt.PointingHandCursor
-
-                    onClicked: {
-                        if (
-                            root.audioSink !== null &&
-                            root.audioSink.audio !== null
-                        ) {
-                            root.audioSink.audio.muted =
-                                !root.audioSink.audio.muted
-                        }
-                    }
-                }
+            AudioModule {
+                id: audioModule
+                service: redCoreService
             }
 
             // ---------------------
@@ -2670,6 +2558,7 @@ PanelWindow {
             // ---------------------
             NetworkModule {
                 id: networkModule
+                service: redCoreService
                 popupCoordinator: redCoreService
             }
 
@@ -2700,73 +2589,17 @@ PanelWindow {
             // ---------------------
             // Weather + Date/Time
             // ---------------------
-            Rectangle {
-                height: 32
-                width: weatherTimeRow.implicitWidth + 20
-                radius: 10
-                color: "#313244"
-
-                Row {
-                    id: weatherTimeRow
-
-                    anchors.centerIn: parent
-                    spacing: 8
-
-                    // Weather placeholder
-                    Text {
-                        text: "--°"
-                        color: "#cdd6f4"
-                        font.pixelSize: 12
-                    }
-
-                    Text {
-                        text:
-                            Qt.formatDateTime(
-                                clock.date,
-                                "dd/MM"
-                            )
-
-                        color: "#cdd6f4"
-                        font.pixelSize: 12
-                    }
-
-                    Text {
-                        text:
-                            Qt.formatDateTime(
-                                clock.date,
-                                "HH:mm"
-                            )
-
-                        color: "#cdd6f4"
-                        font.pixelSize: 12
-                    }
-                }
+            DateWeatherModule {
+                id: dateWeatherModule
+                service: redCoreService
             }
 
             // ---------------------
             // Power
             // ---------------------
-            Rectangle {
-                width: 32
-                height: 32
-                radius: 10
-                color: "#313244"
-
-                Text {
-                    anchors.centerIn: parent
-                    text: "⏻"
-                    color: "#f38ba8"
-                    font.pixelSize: 16
-                }
-
-                MouseArea {
-                    anchors.fill: parent
-                    cursorShape: Qt.PointingHandCursor
-
-                    onClicked: {
-                        console.log("Power menu")
-                    }
-                }
+            PowerModule {
+                id: powerModule
+                service: redCoreService
             }
         }
     }
@@ -2774,6 +2607,23 @@ PanelWindow {
     // =========================
     // MEDIA POPUP
     // =========================
+
+    Connections {
+        target: redCoreService
+
+        function onActivePopupChanged() {
+            mediaPopup.visible =
+                redCoreService.activePopup === "media"
+
+            if (
+                mediaPopup.visible &&
+                root.activePlayer !== null &&
+                root.activePlayer.positionSupported
+            ) {
+                root.activePlayer.positionChanged()
+            }
+        }
+    }
 
     PopupWindow {
         id: mediaPopup
@@ -2783,7 +2633,16 @@ PanelWindow {
         color: "transparent"
 
         implicitWidth: 360
-        implicitHeight: 340
+        implicitHeight: 402
+
+        onVisibleChanged: {
+            if (
+                !visible &&
+                redCoreService.activePopup === "media"
+            ) {
+                redCoreService.closePopup("media")
+            }
+        }
 
         anchor {
             item: mediaButton
@@ -3250,6 +3109,167 @@ PanelWindow {
                     }
                 }
 
+                // Output volume remains usable while this popup is open.
+                Rectangle {
+                    width: parent.width
+                    height: 48
+                    radius: 10
+                    color: "#28283d"
+
+                    Row {
+                        anchors.fill: parent
+                        anchors.margins: 8
+                        spacing: 8
+
+                        Rectangle {
+                            width: 42
+                            height: 30
+                            anchors.verticalCenter:
+                                parent.verticalCenter
+                            radius: 8
+                            color:
+                                audioModule.defaultOutputMuted
+                                ? "#f38ba8"
+                                : "#313244"
+
+                            Text {
+                                anchors.centerIn: parent
+                                text: "SPK"
+                                color:
+                                    audioModule.defaultOutputMuted
+                                    ? "#11111b"
+                                    : "#cdd6f4"
+                                font.pixelSize: 8
+                                font.bold: true
+                            }
+
+                            MouseArea {
+                                anchors.fill: parent
+                                enabled:
+                                    audioModule.defaultOutputReady
+                                cursorShape: enabled
+                                    ? Qt.PointingHandCursor
+                                    : Qt.ArrowCursor
+
+                                onClicked:
+                                    audioModule
+                                        .toggleDefaultOutputMute()
+                            }
+                        }
+
+                        Item {
+                            width: parent.width - 98
+                            height: parent.height
+
+                            Rectangle {
+                                id: mediaVolumeTrack
+
+                                anchors.left: parent.left
+                                anchors.right: parent.right
+                                anchors.leftMargin: 8
+                                anchors.rightMargin: 8
+                                anchors.verticalCenter:
+                                    parent.verticalCenter
+                                height: 10
+                                radius: 5
+                                color: "#45475a"
+
+                                Rectangle {
+                                    width:
+                                        parent.width *
+                                        audioModule
+                                            .defaultOutputVolume
+                                    height: parent.height
+                                    radius: parent.radius
+                                    color: "#89b4fa"
+                                }
+
+                                Rectangle {
+                                    width: 18
+                                    height: 18
+                                    radius: 9
+                                    x: Math.max(
+                                        -width / 2,
+                                        Math.min(
+                                            parent.width - width / 2,
+                                            parent.width *
+                                                audioModule
+                                                    .defaultOutputVolume -
+                                                width / 2
+                                        )
+                                    )
+                                    anchors.verticalCenter:
+                                        parent.verticalCenter
+                                    color: "#cdd6f4"
+                                    border.width: 2
+                                    border.color: "#89b4fa"
+                                }
+                            }
+
+                            MouseArea {
+                                anchors.fill: parent
+                                enabled:
+                                    audioModule.defaultOutputReady
+                                preventStealing: true
+                                cursorShape: enabled
+                                    ? Qt.PointingHandCursor
+                                    : Qt.ArrowCursor
+
+                                function applyVolume(position) {
+                                    if (mediaVolumeTrack.width <= 0)
+                                        return
+
+                                    audioModule.setVolume(
+                                        audioModule.defaultOutput,
+                                        (
+                                            position -
+                                            mediaVolumeTrack.x
+                                        ) / mediaVolumeTrack.width
+                                    )
+                                }
+
+                                onPressed: mouse =>
+                                    applyVolume(mouse.x)
+
+                                onPositionChanged: mouse => {
+                                    if (pressed)
+                                        applyVolume(mouse.x)
+                                }
+
+                                onReleased: mouse =>
+                                    applyVolume(mouse.x)
+
+                                onWheel: wheel => {
+                                    audioModule.stepDefaultOutput(
+                                        wheel.angleDelta.y >= 0
+                                        ? 0.03
+                                        : -0.03
+                                    )
+                                }
+                            }
+                        }
+
+                        Text {
+                            width: 40
+                            anchors.verticalCenter:
+                                parent.verticalCenter
+                            horizontalAlignment:
+                                Text.AlignRight
+                            text:
+                                audioModule.defaultOutputReady
+                                ? Math.round(
+                                    audioModule
+                                        .defaultOutputVolume *
+                                    100
+                                  ) + "%"
+                                : "--%"
+                            color: "#cdd6f4"
+                            font.pixelSize: 10
+                            font.bold: true
+                        }
+                    }
+                }
+
                 // Local playback mode
                 Rectangle {
                     width: 44
@@ -3283,102 +3303,16 @@ PanelWindow {
                     }
                 }
 
-                // System volume
-                Row {
-                    anchors.horizontalCenter: parent.horizontalCenter
-                    spacing: 12
-
-                    Rectangle {
-                        width: 38
-                        height: 30
-                        radius: 9
-                        color: "#313244"
-
-                        Text {
-                            anchors.centerIn: parent
-                            text: "−"
-                            color: "#cdd6f4"
-                            font.pixelSize: 17
-                        }
-
-                        MouseArea {
-                            anchors.fill: parent
-                            cursorShape: Qt.PointingHandCursor
-
-                            onClicked: {
-                                root.changeVolume(-0.05)
-                            }
-                        }
-                    }
-
-                    Rectangle {
-                        width: 84
-                        height: 30
-                        radius: 9
-                        color: "#313244"
-
-                        Text {
-                            anchors.centerIn: parent
-
-                            text:
-                                root.audioSink !== null &&
-                                root.audioSink.audio !== null
-                                ? (
-                                    root.audioSink.audio.muted
-                                    ? "Muted"
-                                    : Math.round(
-                                        root.audioSink.audio.volume * 100
-                                      ) + "%"
-                                  )
-                                : "--%"
-
-                            color: "#cdd6f4"
-                            font.pixelSize: 12
-                        }
-
-                        MouseArea {
-                            anchors.fill: parent
-                            cursorShape: Qt.PointingHandCursor
-
-                            onClicked: {
-                                if (
-                                    root.audioSink !== null &&
-                                    root.audioSink.audio !== null
-                                ) {
-                                    root.audioSink.audio.muted =
-                                        !root.audioSink.audio.muted
-                                }
-                            }
-                        }
-                    }
-
-                    Rectangle {
-                        width: 38
-                        height: 30
-                        radius: 9
-                        color: "#313244"
-
-                        Text {
-                            anchors.centerIn: parent
-                            text: "+"
-                            color: "#cdd6f4"
-                            font.pixelSize: 17
-                        }
-
-                        MouseArea {
-                            anchors.fill: parent
-                            cursorShape: Qt.PointingHandCursor
-
-                            onClicked: {
-                                root.changeVolume(0.05)
-                            }
-                        }
-                    }
-                }
             }
         }
 
-        FrameAnimation {
+        // The progress bar does not need a full frame-rate refresh.
+        // Four event-driven samples per second remain visually smooth
+        // while avoiding needless work when the popup is open.
+        Timer {
+            interval: 250
+            repeat: true
+
             running:
                 mediaPopup.visible &&
                 root.activePlayer !== null &&

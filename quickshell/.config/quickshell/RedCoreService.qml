@@ -18,12 +18,20 @@ Item {
     readonly property bool useBrightnessSimulation:
         false
 
+    readonly property bool useNetworkSimulation:
+        false
+
     property int restartDelay: 1500
     property string activePopup: ""
     property string pendingPopup: ""
 
     readonly property int maximumRestartDelay:
         60000
+
+    readonly property int expectedDaemonProtocolVersion:
+        5
+
+    property int daemonProtocolVersion: 0
 
     readonly property bool running:
         daemonProcess.running
@@ -49,6 +57,13 @@ Item {
     property string activePowerProfile: ""
     property var powerProfiles: []
     property string performanceDegraded: ""
+
+    property bool powerServiceAvailable: false
+    property bool powerOffAvailable: false
+    property bool rebootAvailable: false
+    property bool suspendAvailable: false
+    property bool lockAvailable: false
+    property string powerLocker: ""
 
     property bool brightnessServiceAvailable: false
     property bool brightnessAvailable: false
@@ -79,6 +94,15 @@ Item {
     property var keyboardLayouts: []
     property int keyboardLayoutIndex: 0
 
+    // Persistent Local Media state is stored by Rust.
+    property bool mediaServiceAvailable: false
+    property string mediaLocalUri: ""
+    property string mediaLocalTitle: ""
+    property string mediaLocalArtist: ""
+    property string mediaLocalArt: ""
+    property real mediaLocalPosition: 0
+    property string mediaLocalMode: "normal"
+
     readonly property string daemonLauncher:
         "daemon=\"${REDCORE_DAEMON:-}\"; " +
         "if [ -z \"$daemon\" ] && [ -x \"$HOME/.local/lib/red-core/redcore-daemon\" ]; then " +
@@ -103,6 +127,9 @@ Item {
         if (service.useBrightnessSimulation)
             arguments.push("--simulate-brightness")
 
+        if (service.useNetworkSimulation)
+            arguments.push("--simulate-network")
+
         return arguments
     }
 
@@ -113,6 +140,11 @@ Item {
     signal workspacesActionResult(var data)
     signal appIconResult(var data)
     signal terminalAppsResult(var data)
+    signal mediaLocalState(var data)
+    signal mediaActionResult(var data)
+    signal networkStateEvent(var data)
+    signal networkActionResult(var data)
+    signal powerActionResult(var data)
 
 
     function sendCommand(data) {
@@ -167,6 +199,14 @@ Item {
 
     function handleEvent(data) {
         const event = String(data.event || "")
+
+        if (event === "daemon-ready") {
+            service.daemonProtocolVersion =
+                Number(data.protocolVersion || 0)
+            service.restartDelay = 1500
+            daemonProtocolGuard.stop()
+            return
+        }
 
         if (event === "bluetooth-state") {
             service.restartDelay = 1500
@@ -240,6 +280,23 @@ Item {
                 Array.isArray(data.displays)
                 ? data.displays
                 : []
+            return
+        }
+
+        if (event === "power-state") {
+            service.restartDelay = 1500
+            service.powerServiceAvailable =
+                data.serviceAvailable === true
+            service.powerOffAvailable =
+                data.powerOffAvailable === true
+            service.rebootAvailable =
+                data.rebootAvailable === true
+            service.suspendAvailable =
+                data.suspendAvailable === true
+            service.lockAvailable =
+                data.lockAvailable === true
+            service.powerLocker =
+                String(data.locker || "")
             return
         }
 
@@ -319,6 +376,32 @@ Item {
             return
         }
 
+        if (event === "media-local-state") {
+            service.restartDelay = 1500
+            service.mediaServiceAvailable =
+                data.serviceAvailable === true
+            service.mediaLocalUri =
+                String(data.uri || "")
+            service.mediaLocalTitle =
+                String(data.title || "")
+            service.mediaLocalArtist =
+                String(data.artist || "")
+            service.mediaLocalArt =
+                String(data.art || "")
+            service.mediaLocalPosition =
+                Math.max(0, Number(data.position || 0))
+            service.mediaLocalMode =
+                String(data.mode || "normal")
+            service.mediaLocalState(data)
+            return
+        }
+
+        if (event === "network-state") {
+            service.restartDelay = 1500
+            service.networkStateEvent(data)
+            return
+        }
+
         if (event === "bluetooth-action-result") {
             service.bluetoothActionResult(data)
             return
@@ -332,11 +415,41 @@ Item {
 
         if (event === "workspaces-action-result")
             service.workspacesActionResult(data)
+
+        if (event === "media-action-result")
+            service.mediaActionResult(data)
+
+        if (event === "network-action-result")
+            service.networkActionResult(data)
+
+        if (event === "power-action-result")
+            service.powerActionResult(data)
     }
 
 
     Component.onCompleted: {
         daemonProcess.running = true
+    }
+
+
+    Timer {
+        id: daemonProtocolGuard
+
+        interval: 4000
+        repeat: false
+
+        onTriggered: {
+            if (
+                daemonProcess.running &&
+                service.daemonProtocolVersion !==
+                    service.expectedDaemonProtocolVersion
+            ) {
+                console.warn(
+                    "Restarting an outdated Red Core daemon"
+                )
+                daemonProcess.running = false
+            }
+        }
     }
 
 
@@ -373,8 +486,14 @@ Item {
         }
 
         onRunningChanged: {
-            if (running)
+            if (running) {
+                service.daemonProtocolVersion = 0
+                daemonProtocolGuard.restart()
                 return
+            }
+
+            daemonProtocolGuard.stop()
+            service.daemonProtocolVersion = 0
 
             service.bluetoothServiceAvailable = false
             service.batteryServiceAvailable = false
@@ -382,6 +501,12 @@ Item {
             service.brightnessAvailable = false
             service.brightnessSimulated = false
             service.brightnessDisplays = []
+            service.powerServiceAvailable = false
+            service.powerOffAvailable = false
+            service.rebootAvailable = false
+            service.suspendAvailable = false
+            service.lockAvailable = false
+            service.powerLocker = ""
             service.systemMonitorServiceAvailable = false
             service.systemMonitorCpuUsage = 0
             service.systemMonitorCpuTemp = null
@@ -400,6 +525,7 @@ Item {
             service.workspaceWindows = []
             service.keyboardLayouts = []
             service.keyboardLayoutIndex = 0
+            service.mediaServiceAvailable = false
 
             restartTimer.interval =
                 service.restartDelay

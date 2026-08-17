@@ -844,6 +844,17 @@ mod tests {
             app_id: None,
             icon_name: None,
             windows: None,
+            media: None,
+            request_id: None,
+            device: None,
+            ssid: None,
+            password: None,
+            security_mode: None,
+            saved_uuid: None,
+            uuid: None,
+            hidden: None,
+            autoconnect: None,
+            autoconnect_priority: None,
         }
     }
 

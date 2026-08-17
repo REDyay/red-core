@@ -6,5 +6,5 @@ Exec=redcore-local-media %f
 Icon=audio-x-generic
 Terminal=false
 NoDisplay=true
-MimeType=audio/mpeg;audio/flac;audio/ogg;audio/x-vorbis+ogg;audio/opus;audio/mp4;audio/aac;audio/x-wav;audio/x-ms-wma;
+MimeType=audio/mpeg;audio/flac;audio/ogg;audio/x-vorbis+ogg;audio/x-speex+ogg;audio/x-speex;audio/opus;audio/mp4;audio/x-m4b;audio/aac;audio/x-wav;audio/x-ms-wma;audio/x-aiff;audio/x-aifc;audio/x-ape;audio/matroska;audio/ac3;audio/vnd.dts;audio/x-dsf;audio/x-dff;audio/x-musepack;audio/x-tak;audio/x-tta;audio/x-wavpack;audio/AMR;audio/basic;audio/midi;audio/vnd.rn-realaudio;
 Categories=AudioVideo;Audio;Player;

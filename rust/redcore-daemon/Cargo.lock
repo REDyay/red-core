@@ -460,6 +460,7 @@ dependencies = [
  "dbus",
  "dbus-tokio",
  "futures-util",
+ "libc",
  "serde",
  "serde_json",
  "tokio",
